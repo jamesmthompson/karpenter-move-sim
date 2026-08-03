@@ -64,6 +64,19 @@ func TestRFCHeterogeneousDisruption(t *testing.T) {
 	nodeA := []*corev1.Pod{pod("a1", ""), pod("a2", ""), pod("a3", ""), pod("a4", "")}
 	nodeB := []*corev1.Pod{pod("b1", ""), pod("b2", maxCost), pod("b3", maxCost), pod("b4", maxCost)}
 
+	// Neither node holds a gang, so the step in MoveDisruptionCost does not apply
+	// here and the RFC's arithmetic is reproduced by the sum. Stated because the
+	// gang path is the one thing that could move these two numbers without
+	// anything in the example changing.
+	for _, pods := range [][]*corev1.Pod{nodeA, nodeB} {
+		if got := GangsBroken(pods); len(got) != 0 {
+			t.Fatalf("the RFC example acquired gangs %v; its numbers assume none", got)
+		}
+		if NodeDisruptionCost(pods) != RescheduleDisruptionCost(pods) {
+			t.Fatalf("the gang-aware cost diverged from the sum on a gangless node")
+		}
+	}
+
 	// The RFC's pool: 8 m7i.xlarge at $4.84/day and 2 m7i.2xlarge at $9.68,
 	// totalling $58.08/day with 80 pods. Its stated total disruption cost of 107
 	// counts 76 default-cost pods plus node B's 31, and omits the per-node

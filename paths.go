@@ -410,12 +410,18 @@ func computeBatchConsolidation(batch, dests []NodeSnapshot, cat *Catalog, totals
 	}
 
 	var pods []*corev1.Pod
-	sumPrice, sumDisruption := 0.0, 0.0
+	sumPrice := 0.0
 	for _, c := range batch {
 		pods = append(pods, c.ReschedulablePods...)
 		sumPrice += c.Price
-		sumDisruption += c.DisruptionCost
 	}
+	// Priced over the batch's whole evicted set rather than summed per node, so a
+	// gang with members on two of these nodes is charged once instead of twice.
+	// Summing c.DisruptionCost, which is what this did, charged it per node and
+	// made a batch that takes a gang whole look dearer than one that breaks it and
+	// leaves the rest running. With no gangs in the batch the two are equal, term
+	// for term, apart from the baseline both count once per node.
+	sumDisruption := MoveDisruptionCost(len(batch), pods)
 
 	// A node in the batch is being drained, so it cannot receive the batch's own
 	// pods. withoutNode per member rather than a set test, because dests is short

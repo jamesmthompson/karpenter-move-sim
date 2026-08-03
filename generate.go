@@ -200,6 +200,23 @@ type PodShape struct {
 	PDBFraction          float64
 	SpreadFraction       float64
 
+	// GangFraction is the share of pods belonging to a gang-scheduled workload,
+	// and GangCount how many distinct gangs those pods are spread over. A gang's
+	// members are all-or-nothing in value, so breaking one member costs the whole
+	// workload: see gang.go.
+	//
+	// Gang membership is drawn per pod rather than per gang, which means a gang's
+	// realized size is whatever the draw gave it and its members land on whatever
+	// nodes the packer put them on. That is the case worth generating, because a
+	// gang confined to one node is the easy case and a gang spread over several is
+	// where per-node pricing stops being able to see the whole workload.
+	//
+	// GangOutageCost is what one gang going down is worth, in EvictionCost units.
+	// Zero means DefaultGangOutageCost.
+	GangFraction   float64
+	GangCount      int
+	GangOutageCost float64
+
 	// WorkloadCount is how many distinct workloads pods are drawn from. Every
 	// relational constraint selects on WorkloadLabel, so this is the size of the
 	// group a constraint relates. One workload means every constrained pod
@@ -388,6 +405,13 @@ func GenClusterWith(r *rand.Rand, opts GenClusterOpts) ([]NodeSnapshot, PoolTota
 }
 
 // Totals sums the two denominators the score divides by.
+//
+// Disruption cost is a sum over nodes with one correction: a gang spanning
+// several nodes is charged to each of them, and the pool total counts each gang
+// once, so the duplicate charges are subtracted. Without the correction the
+// denominator grows with how scattered the gangs are rather than with how much
+// disruptable work the pool holds, and every score in the pool shrinks because a
+// gang got spread over two nodes instead of one. See poolGangOverCount.
 func Totals(nodes []NodeSnapshot) PoolTotals {
 	var t PoolTotals
 	for _, n := range nodes {
@@ -404,18 +428,33 @@ func Totals(nodes []NodeSnapshot) PoolTotals {
 		t.Cost += n.Price
 		t.DisruptionCost += n.DisruptionCost
 	}
+	t.DisruptionCost -= poolGangOverCount(nodes)
+	// The correction subtracts gang charges the per-node sum contained. If a caller
+	// built DisruptionCost from RescheduleDisruptionCost on nodes whose pods carry
+	// gang labels, the sum never contained them and the subtraction overshoots. The
+	// symptom would be a quietly understated denominator inflating every score in
+	// the pool, so refuse rather than return one.
+	if floor := float64(len(nodes)) * PerNodeBaseDisruptionCost; t.DisruptionCost < floor {
+		panic(fmt.Sprintf("pool disruption cost %g fell below %d nodes' baselines; "+
+			"snapshot costs must come from NodeDisruptionCost when pods carry gang labels",
+			t.DisruptionCost, len(nodes)))
+	}
 	return t
 }
 
-// disruptionCost is the per-node baseline plus each pod's scoring eviction cost.
+// disruptionCost is what draining this node alone costs.
 //
 // It was float64(len(pods)) + 1.0, which hardcoded every pod at 1.0 and made
 // pod-deletion-cost and pod priority inert. That is the RFC's degenerate default
 // case, and scoring it as though it were the general case meant the simulator
 // could not reproduce the RFC's own heterogeneous example: two nodes with equal
 // savings and equal pod counts scoring 2.24 and 0.29.
+//
+// It is NodeDisruptionCost rather than RescheduleDisruptionCost, so a gang member
+// on the node prices the gang's outage instead of one pod's restart. On a fixture
+// with no gangs the two are identical.
 func disruptionCost(pods []*corev1.Pod) float64 {
-	return RescheduleDisruptionCost(pods)
+	return NodeDisruptionCost(pods)
 }
 
 // thin removes pods from a random subset of nodes. The instance type stays what
@@ -692,8 +731,28 @@ func (s PodShape) draw(r *rand.Rand, name string) *corev1.Pod {
 		workloads = 8
 	}
 	workload := fmt.Sprintf("w%d", r.Intn(workloads))
+	// The gang draws come off a substream seeded from the pod's name rather than
+	// off r, and both are drawn unconditionally.
+	//
+	// Unconditional for the reason the seven flags above are: consuming a position
+	// only when the flag comes up would make GangCount move which pods are members.
+	//
+	// Off a substream because the flags above cannot manage it. Every one of them
+	// takes a position in r, so adding an eighth shifts every draw after it and
+	// every generated cluster changes. The read-cost measurement is pinned to that
+	// stream at three cluster sizes, and moving it broke all three assertions with
+	// GangFraction still at zero. A substream keyed on the pod's name is a pure
+	// function of the fixture, so it reproduces under a fixed seed while leaving
+	// every existing number where it was.
+	gr := rand.New(rand.NewSource(int64(nameHash(name))))
+	inGang := gr.Float64() < s.GangFraction
+	gangs := s.GangCount
+	if gangs < 1 {
+		gangs = 4
+	}
+	gang := fmt.Sprintf("g%d", gr.Intn(gangs))
 
-	if doNotDisrupt || expensive {
+	if doNotDisrupt || expensive || inGang {
 		pod.Annotations = map[string]string{}
 	}
 	if doNotDisrupt {
@@ -709,8 +768,18 @@ func (s PodShape) draw(r *rand.Rand, name string) *corev1.Pod {
 
 	// Every relational constraint selects on WorkloadLabel, so a pod carrying any
 	// of them needs the label for the others' selectors to find it.
-	if antiAffine || affine || inPDB || spread {
+	if antiAffine || affine || inPDB || spread || inGang {
 		pod.Labels = map[string]string{WorkloadLabel: workload}
+	}
+	if inGang {
+		outage := s.GangOutageCost
+		if outage <= 0 {
+			outage = DefaultGangOutageCost
+		}
+		pod.Labels[GangLabel] = gang
+		// Replicated onto every member, because the node holding one member has to
+		// be able to price the whole outage without reading the others.
+		pod.Annotations[GangOutageCostAnnotation] = strconv.FormatFloat(outage, 'f', -1, 64)
 	}
 	if inPDB {
 		// A real PDB has a selector and the pod carries whatever it matches. One
@@ -757,6 +826,23 @@ func (s PodShape) draw(r *rand.Rand, name string) *corev1.Pod {
 		}}
 	}
 	return pod
+}
+
+// nameHash is FNV-1a over the pod's name, the seed for the gang substream.
+//
+// Written out rather than taken from hash/fnv so the constants are visible: a
+// substream seed that changes silently changes which pods are gang members, and
+// that is the kind of thing a stdlib version bump could do without anyone
+// noticing which measurement moved.
+func nameHash(name string) uint64 {
+	const offset64 = 14695981039346656037
+	const prime64 = 1099511628211
+	h := uint64(offset64)
+	for i := 0; i < len(name); i++ {
+		h ^= uint64(name[i])
+		h *= prime64
+	}
+	return h
 }
 
 func affinityOf(pod *corev1.Pod) *corev1.Affinity {

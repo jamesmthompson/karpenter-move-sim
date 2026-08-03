@@ -55,6 +55,12 @@ const PerNodeBaseDisruptionCost = 1.0
 // Eviction ordering still sees the signed value.
 //
 // This mirrors upstream's computeRescheduleDisruptionCost.
+//
+// It is a sum, so it cannot price a workload whose value is all-or-nothing: a
+// gang of five members costs five restarts here, when the truth is one outage.
+// MoveDisruptionCost in gang.go is the gang-aware form, and the two agree term
+// for term on pods carrying no gang label. This one is kept because it is what
+// upstream computes, and the divergence should be visible rather than absorbed.
 func RescheduleDisruptionCost(pods []*corev1.Pod) float64 {
 	cost := PerNodeBaseDisruptionCost
 	for _, p := range pods {

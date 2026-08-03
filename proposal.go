@@ -72,7 +72,12 @@ type NodeSnapshot struct {
 	// Pods that would have to be rescheduled if this node went away.
 	ReschedulablePods []*corev1.Pod
 
-	// Sum of per-pod eviction costs, plus the per-node baseline.
+	// What draining this node alone costs: the per-node baseline, the per-pod
+	// eviction costs of pods in no gang, and one full outage per gang holding a
+	// member here. NodeDisruptionCost computes it.
+	//
+	// It is a bound rather than an exact figure when a gang spans nodes, because a
+	// node cannot see members it does not hold. See NodeDisruptionCost.
 	DisruptionCost float64
 }
 

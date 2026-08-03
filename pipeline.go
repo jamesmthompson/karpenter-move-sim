@@ -504,7 +504,8 @@ func (k *ScoreStillClearsChecker) Check(_ context.Context, p Proposal) error {
 	r := k.begin(k.Cluster)
 
 	savings := 0.0
-	disruption := 0.0
+	live := 0
+	var evicted []*corev1.Pod
 	for _, cand := range p.Candidates {
 		n, ok := r.Node(cand.ProviderID)
 		if !ok || n.Deleted {
@@ -515,8 +516,14 @@ func (k *ScoreStillClearsChecker) Check(_ context.Context, p Proposal) error {
 		}
 		k.evals++
 		savings += n.Price
-		disruption += RescheduleDisruptionCost(n.Pods)
+		live++
+		evicted = append(evicted, n.Pods...)
 	}
+	// The recheck prices the whole evicted set at once, which is how stage 2 priced
+	// it. Summing per-node costs here would charge a gang spanning two candidates
+	// twice, so a move stage 2 approved could fail its own recheck with nothing in
+	// the cluster having changed.
+	disruption := MoveDisruptionCost(live, evicted)
 	// A REPLACE recovers the price difference, not the full price. Stage 2 priced
 	// the replacement from the catalog and prices do not move within a pass, so the
 	// replacement's price is subtracted from what the candidates give back.
