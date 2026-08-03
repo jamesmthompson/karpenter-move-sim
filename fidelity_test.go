@@ -37,6 +37,12 @@ func TestNonFinitePriceRejected(t *testing.T) {
 // Emptiness is disruption cost carrying only the baseline, matching upstream's
 // IsEmpty. A pod with a maximally negative deletion cost clamps to zero, so a
 // node holding only that pod is empty even though its pod count is one.
+//
+// Rewritten when the three paths were split apart. The empty delete used to come
+// out of ConsolidationGenerator.Generate, which is where upstream does not put it:
+// consolidation.ShouldDisrupt routes empty nodes away and Emptiness handles them
+// under its own reason. So the generator must now decline and the emptiness path
+// must claim it.
 func TestEmptinessMatchesUpstreamDefinition(t *testing.T) {
 	free := pod("free", "-2147483647")
 	nodes := []NodeSnapshot{{
@@ -51,8 +57,23 @@ func TestEmptinessMatchesUpstreamDefinition(t *testing.T) {
 	if !IsEffectivelyEmpty(nodes[0].DisruptionCost) {
 		t.Fatal("node with one zero-cost pod should count as empty")
 	}
-	// The empty branch emits one delete with no Evict actions.
-	got := ConsolidationGenerator{Threshold: 0.5}.Generate(nodes[0], nil, BuildCatalog(), Totals(nodes))
+	totals := Totals(nodes)
+
+	// The consolidation generator declines, which is consolidation.ShouldDisrupt.
+	if got := (ConsolidationGenerator{Threshold: 0.5}).Generate(nodes[0], nil, BuildCatalog(), totals); len(got) != 0 {
+		t.Errorf("the consolidation generator produced %d proposals for an empty node; Emptiness owns it", len(got))
+	}
+	if (MultiNodeEvaluation{}).ShouldDisrupt(nodes[0], totals, 0.5) {
+		t.Error("multi-node accepted an empty candidate")
+	}
+	if (SingleNodeEvaluation{}).ShouldDisrupt(nodes[0], totals, 0.5) {
+		t.Error("single-node accepted an empty candidate")
+	}
+	if !(EmptinessEvaluation{}).ShouldDisrupt(nodes[0], totals, 0.5) {
+		t.Fatal("the emptiness path rejected an empty candidate")
+	}
+
+	got := EmptinessEvaluation{}.Evaluate(nodes, nil, BuildCatalog(), totals, poolBudgets(nodes, 10))
 	if len(got) != 1 {
 		t.Fatalf("want one proposal, got %d", len(got))
 	}
@@ -60,6 +81,39 @@ func TestEmptinessMatchesUpstreamDefinition(t *testing.T) {
 		if a.Kind == Evict {
 			t.Error("empty-node proposal must not evict")
 		}
+	}
+	if got[0].Reason != ReasonEmpty {
+		t.Errorf("reason: got %s want Empty", got[0].Reason)
+	}
+	// Emptiness never scores. A number here would invite a threshold that upstream
+	// does not apply, and a score of zero is what a Proposal carries when nothing
+	// compared it against one.
+	if got[0].Score != 0 {
+		t.Errorf("the emptiness path scored the move at %v; upstream never scores it", got[0].Score)
+	}
+}
+
+// A high enough threshold rejects every scored move and must not touch the
+// emptiness path. This is the behavior the routing exists for: an empty node is
+// deleted whatever it would have scored.
+func TestEmptinessIgnoresTheThreshold(t *testing.T) {
+	// Two loaded nodes make the pool cost large, so the empty node's savings
+	// fraction is small and its score would fail any reasonable floor.
+	loaded := []*corev1.Pod{pod("p1", ""), pod("p2", ""), pod("p3", "")}
+	nodes := []NodeSnapshot{
+		{ProviderID: "i-empty", Price: 0.0892, DisruptionCost: PerNodeBaseDisruptionCost},
+		{ProviderID: "i-a", Price: 3.2256, ReschedulablePods: loaded, DisruptionCost: RescheduleDisruptionCost(loaded)},
+		{ProviderID: "i-b", Price: 3.2256, ReschedulablePods: loaded, DisruptionCost: RescheduleDisruptionCost(loaded)},
+	}
+	totals := Totals(nodes)
+
+	// The premise: scored, this node fails.
+	if score := Score(nodes[0].Price, nodes[0].DisruptionCost, totals); score >= 0.5 {
+		t.Fatalf("premise broken: the empty node scores %.4f, which passes", score)
+	}
+	got := EmptinessEvaluation{}.Evaluate(nodes[:1], nil, BuildCatalog(), totals, poolBudgets(nodes, 10))
+	if len(got) != 1 {
+		t.Fatalf("the emptiness path refused a move a score would have refused; got %d proposals", len(got))
 	}
 }
 

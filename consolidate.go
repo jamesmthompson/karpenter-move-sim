@@ -7,7 +7,10 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 )
 
-// ConsolidationGenerator produces proposals that remove a node.
+// ConsolidationGenerator produces proposals that remove a node. It is the
+// single-node path's move generator, upstream's computeConsolidation for one
+// candidate, and SingleNodeEvaluation is what calls it. Emptiness and multi-node
+// are separate evaluations in paths.go.
 //
 // A move deletes the source and places its pods somewhere. Savings is the
 // source's full price, because a destination that already exists keeps costing
@@ -37,39 +40,26 @@ func (g ConsolidationGenerator) Generate(n NodeSnapshot, dests []NodeSnapshot, c
 		return nil
 	}
 
+	// An empty node belongs to the Emptiness path, which never scores it and
+	// charges a different budget. Upstream routes it away here, in
+	// consolidation.ShouldDisrupt: "Empty nodes are handled by Emptiness (reason
+	// \"Empty\") for correct budget accounting." Emitting a scored empty delete
+	// from this generator, which is what it used to do, put empty nodes in
+	// competition with underutilized ones for one budget.
+	if IsEffectivelyEmpty(n.DisruptionCost) {
+		return nil
+	}
+
 	// The delete ratio bounds every single-node move from this node. Below the
-	// threshold, no move from here can pass, so skip generation.
+	// threshold, no move from here can pass, so skip generation. This is
+	// upstream's CanPassThreshold, which lives in the single-node loop and has no
+	// multi-node counterpart, because a node that cannot pass alone can still
+	// ride in a batch that does.
 	if DeleteRatio(n, totals) < g.Threshold {
 		return nil
 	}
 
 	var out []Proposal
-
-	// An empty node is a delete with nothing to place. Upstream tests emptiness
-	// as disruption cost having only the baseline in it, not as a pod count, so a
-	// node whose only pod has a maximally negative deletion cost counts as empty.
-	// It then routes empty nodes to a separate controller that never scores them.
-	// Scoring them here lets them compete for budget against real consolidations.
-	if IsEffectivelyEmpty(n.DisruptionCost) {
-		out = append(out, Proposal{
-			ID:         fmt.Sprintf("del-empty/%s", n.ProviderID),
-			Candidates: []NodeSnapshot{n},
-			Savings:    n.Price,
-			Score:      Score(n.Price, n.DisruptionCost, totals),
-			Actions: []Action{
-				{Kind: Taint, ProviderID: n.ProviderID},
-				{Kind: Delete, ProviderID: n.ProviderID, DependsOn: []int{0}},
-			},
-			// No ScoreStillClears. The empty branch never gated on the threshold
-			// in the first place, so re-checking one would refuse work this
-			// generator approved unconditionally. A node whose pods came back is
-			// caught by NoDoNotDisrupt and PodsStillFit on the next pass, where it
-			// is no longer empty and takes the scored path.
-			Preconditions: []PreconditionKind{NoDoNotDisrupt, BudgetHasRoom, NotNominated},
-			Reason:        ReasonEmpty,
-		})
-		return out
-	}
 
 	// One move per candidate, delete preferred.
 	//
@@ -247,20 +237,31 @@ func (c BandConfig) Classify(n NodeSnapshot, cat *Catalog, totals PoolTotals) Ba
 
 // consolidationPreconditions is what the proposal declares stage 4 must check.
 //
-// A relational constraint is declared only when a pod on this node carries it.
-// Declaring all four on every proposal would charge every move for constraints
-// nobody in it has, and the read counts are what the measurement is about.
+// A relational constraint is declared only when a pod on one of these nodes
+// carries it. Declaring all four on every proposal would charge every move for
+// constraints nobody in it has, and the read counts are what the measurement is
+// about.
 //
-// Every test here reads the node's own pods, which is what Disruptable already
+// It takes a batch rather than one node, because multi-node proposals remove
+// several. A batch declares the union of its members' constraints: one pod
+// carrying topology spread makes the whole batch's removal depend on the
+// distribution, and checking a proper subset would approve a move nobody checked.
+//
+// Every test here reads the nodes' own pods, which is what Disruptable already
 // does, so stage 2 stays local. Deciding a constraint takes the cluster; noticing
 // that a pod carries one does not.
-func consolidationPreconditions(n NodeSnapshot) []PreconditionKind {
+func consolidationPreconditions(batch ...NodeSnapshot) []PreconditionKind {
 	// ScoreStillClears is on every consolidation proposal, DELETE and REPLACE
 	// alike, because both are approved by the same comparison and either can decay
 	// past it between generation and apply. A provisioning proposal carries no
-	// score, so it does not declare this.
+	// score, so it does not declare this, and neither does an empty delete, which
+	// was never gated on a threshold.
 	pre := []PreconditionKind{ScoreStillClears, PodsStillFit, NoDoNotDisrupt, BudgetHasRoom, NotNominated}
-	if len(n.ReschedulablePods) > 0 {
+	pods := 0
+	for _, n := range batch {
+		pods += len(n.ReschedulablePods)
+	}
+	if pods > 0 {
 		pre = append(pre, PDBAllows)
 	}
 	for _, kind := range []struct {
@@ -271,14 +272,22 @@ func consolidationPreconditions(n NodeSnapshot) []PreconditionKind {
 		{AffinityHolds, AffinityConstraint{}.Applies},
 		{TopologyHolds, TopologyConstraint{}.Applies},
 	} {
-		for _, p := range n.ReschedulablePods {
-			if kind.applies(p) {
-				pre = append(pre, kind.kind)
-				break
-			}
+		if anyPodCarries(batch, kind.applies) {
+			pre = append(pre, kind.kind)
 		}
 	}
 	return pre
+}
+
+func anyPodCarries(batch []NodeSnapshot, applies func(*corev1.Pod) bool) bool {
+	for _, n := range batch {
+		for _, p := range n.ReschedulablePods {
+			if applies(p) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // aggregateRoom reports whether the destinations have room for required in

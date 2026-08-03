@@ -160,8 +160,23 @@ type Cluster struct {
 	// aimed at them. Draining one strands that pod.
 	Nominated map[string]bool
 
-	// Budget is nodes still disruptable this window.
+	// Budget is nodes still disruptable this window under reason Underutilized.
+	// It is the field every existing caller reads, so it stays the underutilized
+	// counter rather than becoming an aggregate.
 	Budget int
+
+	// EmptyBudget is the same allowance for reason Empty. Upstream builds a
+	// disruption budget mapping per method, inside disrupt(), so Emptiness and the
+	// two consolidation methods never share a decremented counter. That is the
+	// accounting the comment in consolidation.ShouldDisrupt is about: "Empty nodes
+	// are handled by Emptiness (reason \"Empty\") for correct budget accounting."
+	//
+	// Stage 3 has accounted per reason since selectWithBudgets. Stage 4 did not,
+	// and with only single-node proposals in existence nothing ever showed it: one
+	// empty delete and one underutilized delete each cost 1 and the shared counter
+	// was 20. A 20-node multi-node batch spends the whole allowance, and then the
+	// empty batch stopped on a budget upstream would not have charged it.
+	EmptyBudget int
 
 	// PDBs are the PodDisruptionBudget objects, keyed by the label value their
 	// selector matches. Built by IndexPDBs, which is the PDB controller's work and
@@ -197,12 +212,15 @@ type Cluster struct {
 // It does not fill in Totals or Threshold. Both are stage-3 inputs the caller
 // already holds, and summing the pool here would put Totals' adversarial price
 // guard on a constructor that has no other reason to reject a cluster.
+// EmptyBudget is seeded to the same allowance, which is what a per-method mapping
+// gives each method when the NodePool declares one budget for all reasons.
 func NewCluster(nodes []NodeSnapshot, cat *Catalog, budget int) *Cluster {
 	c := &Cluster{
-		Catalog:   cat,
-		Nodes:     make(map[string]*ClusterNode, len(nodes)),
-		Nominated: map[string]bool{},
-		Budget:    budget,
+		Catalog:     cat,
+		Nodes:       make(map[string]*ClusterNode, len(nodes)),
+		Nominated:   map[string]bool{},
+		Budget:      budget,
+		EmptyBudget: budget,
 	}
 	for _, n := range nodes {
 		pods := make([]*corev1.Pod, len(n.ReschedulablePods))
@@ -577,20 +595,53 @@ func (k NoDoNotDisruptChecker) Check(_ context.Context, p Proposal) error {
 }
 
 // BudgetHasRoomChecker gates on the NodePool's remaining disruption allowance.
+//
+// What it counts is the deletions still to come, not the proposal's whole
+// candidate list. The two are the same for a single-node move and they are not for
+// a batch, because the executor decrements the budget on each Delete and this runs
+// again before the next action. Counting the whole batch made a batch of N stop on
+// its own first Delete, every time, as soon as the budget was exactly N: 20 taints
+// and 49 evictions fired, then the budget fell to 19, then the check refused the
+// remaining 19 deletions of a move it had already approved. The emptiness and
+// multi-node paths both emit batches, so this only became reachable when they did.
 type BudgetHasRoomChecker struct{ Cluster *Cluster }
 
 func (k BudgetHasRoomChecker) Kind() PreconditionKind { return BudgetHasRoom }
 
 func (k BudgetHasRoomChecker) Check(_ context.Context, p Proposal) error {
-	need := len(p.Candidates)
+	need := 0
+	for _, cand := range p.Candidates {
+		n, ok := k.Cluster.Nodes[cand.ProviderID]
+		if !ok || n.Deleted {
+			continue
+		}
+		need++
+	}
 	if need == 0 {
-		// A launch removes nothing, so it spends no budget.
+		// A launch removes nothing, and neither does a batch already applied.
 		return nil
 	}
-	if k.Cluster.Budget < need {
-		return fmt.Errorf("budget has %d, move needs %d", k.Cluster.Budget, need)
+	if have := k.Cluster.budgetFor(p.Reason); have < need {
+		return fmt.Errorf("%s budget has %d, move needs %d more deletions", p.Reason, have, need)
 	}
 	return nil
+}
+
+// budgetFor returns the counter a proposal's reason draws on.
+func (c *Cluster) budgetFor(r Reason) int {
+	if r == ReasonEmpty {
+		return c.EmptyBudget
+	}
+	return c.Budget
+}
+
+// spendBudget charges one deletion to the reason's counter.
+func (c *Cluster) spendBudget(r Reason) {
+	if r == ReasonEmpty {
+		c.EmptyBudget--
+		return
+	}
+	c.Budget--
 }
 
 // NotNominatedChecker rejects draining a node the scheduler already aimed a
@@ -734,7 +785,7 @@ func (e *MemoryExecutor) Apply(ctx context.Context, p Proposal) (Outcome, error)
 			if err := e.Cluster.Delete(a.ProviderID); err != nil {
 				return Proceed, err
 			}
-			e.Cluster.Budget--
+			e.Cluster.spendBudget(p.Reason)
 		}
 		fired++
 		confirmed[i] = true
@@ -781,6 +832,18 @@ type RunConfig struct {
 	// and their costs differ by the cluster size, which is what readcost_test.go
 	// reports.
 	RecomputePDB bool
+
+	// StopAfterFirstPath returns after the first of the three paths that produces
+	// anything, which is upstream's Reconcile: "We'll only let one method perform
+	// an action," then requeue immediately. A pass with this off runs all three,
+	// so one pass reports what three consecutive reconciles would do. That is the
+	// form a savings-per-pass measurement needs, and it is the divergence.
+	StopAfterFirstPath bool
+
+	// SingleNodeMaxProposals caps how many proposals the single-node path emits.
+	// Upstream returns after the first valid command; zero here means no cap. See
+	// SingleNodeEvaluation.MaxProposals.
+	SingleNodeMaxProposals int
 }
 
 func DefaultRunConfig(k float64, budget int) RunConfig {
@@ -851,6 +914,11 @@ type Result struct {
 	// cost the locality split is about, measured rather than asserted.
 	NodeReads map[PreconditionKind]int
 
+	// Paths is what each of the three evaluations contributed. The interaction
+	// between them is what decides a cluster's outcome, so a pass that reports
+	// only a total cannot say which path produced it.
+	Paths map[Path]PathStats
+
 	IdentifyNanos int64
 	GenerateNanos int64
 	CompactNanos  int64
@@ -865,6 +933,14 @@ func Run(ctx context.Context, nodes []NodeSnapshot, totals PoolTotals, cat *Cata
 	res := Result{NodesIn: len(nodes), PoolCostBefore: totals.Cost}
 
 	// Stage 1. One bit per node, no cluster.
+	//
+	// Identify's bit is the single-node path's filter: Disruptable and the delete
+	// ratio. It is reported rather than used to gate stage 2, because two of the
+	// three paths do not apply it. Emptiness never scores at all, and multi-node
+	// has no CanPassThreshold, since a node that cannot pass alone can still ride
+	// in a batch that does. Feeding Identify's output to all three paths would
+	// deny multi-node candidates upstream gives it, and would drop empty nodes
+	// whose delete ratio is high but whose pool has a large denominator.
 	t0 := time.Now()
 	bits := Identify(nodes, totals, cfg.K)
 	res.IdentifyNanos = time.Since(t0).Nanoseconds()
@@ -874,20 +950,14 @@ func Run(ctx context.Context, nodes []NodeSnapshot, totals PoolTotals, cat *Cata
 		}
 	}
 
-	// Stage 2. Destination set once, then one generator call per candidate.
+	// Stage 2. Destination set once, then the three paths in upstream's order.
 	t1 := time.Now()
 	dests := EligibleDestinations(nodes, cat, totals, cfg.Bands)
 	res.Destinations = len(dests)
-	gen := ConsolidationGenerator{Threshold: cfg.Threshold}
-	var proposals []Proposal
-	for i, n := range nodes {
-		if !bits[i] {
-			continue
-		}
-		proposals = append(proposals, gen.Generate(n, withoutNode(dests, n.ProviderID), cat, totals)...)
-	}
+	proposals, paths := EvaluateInOrder(nodes, dests, cat, totals, cfg)
 	res.GenerateNanos = time.Since(t1).Nanoseconds()
 	res.ProposalsGenerated = len(proposals)
+	res.Paths = paths
 
 	// Stage 3. Cluster state enters here.
 	cluster := NewCluster(nodes, cat, cfg.Budget)

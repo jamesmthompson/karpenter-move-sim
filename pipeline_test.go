@@ -90,15 +90,16 @@ func TestGenerate(t *testing.T) {
 		wantKinds []ActionKind
 	}{
 		{
-			// An empty node is a delete with nothing to place. No Launch,
-			// no Evict, and PodsStillFit is not among the preconditions
-			// because there are no pods to fit.
-			name:      "empty node produces a delete proposal",
+			// An empty node belongs to the Emptiness path, so the consolidation
+			// generator declines it. Upstream declines it in the same place, in
+			// consolidation.ShouldDisrupt. The empty delete's shape is asserted
+			// in TestEmptinessMatchesUpstreamDefinition, against the path that
+			// now owns it.
+			name:      "empty node is left to the emptiness path",
 			source:    empty,
 			all:       []NodeSnapshot{empty, busyA, busyB},
 			threshold: 0.5,
-			wantAny:   true,
-			wantKinds: []ActionKind{Taint, Delete},
+			wantAny:   false,
 		},
 		{
 			// A node at pool-average price per unit of disruption sits at a

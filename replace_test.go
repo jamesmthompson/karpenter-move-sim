@@ -255,6 +255,15 @@ func TestLooseClusterPrefersDelete(t *testing.T) {
 		if !Disruptable(n) || DeleteRatio(n, totals) < cfg.Threshold {
 			continue
 		}
+		// An empty node belongs to the Emptiness path, and deleteOnto and
+		// replaceWith both still answer for one when called directly: an empty
+		// node's pods trivially fit anywhere, and the cheapest instance type is
+		// cheaper than whatever it is running. Generate declines it, so a loop
+		// comparing the two halves against Generate has to skip it too. This was the
+		// one caller that reached past Generate into the halves.
+		if IsEffectivelyEmpty(n.DisruptionCost) {
+			continue
+		}
 		del, delOK := gen.deleteOnto(n, withoutNode(dests, n.ProviderID), cat, totals)
 		rep, repOK := gen.replaceWith(n, cat, totals)
 		if !delOK || !repOK {

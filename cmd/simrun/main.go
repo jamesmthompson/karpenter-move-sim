@@ -72,6 +72,19 @@ func report(seed int64, k float64, cfg sim.RunConfig, r sim.Result) string {
 		r.NodesIn, r.CandidatesOut, pct(r.CandidatesOut, r.NodesIn), dur(r.IdentifyNanos))
 	f("stage 2  generate     %5d destinations, %d proposals        %s\n",
 		r.Destinations, r.ProposalsGenerated, dur(r.GenerateNanos))
+	// Per path, in the order upstream runs them. A total cannot say which of the
+	// three produced it, and the interaction between them is what decides an
+	// outcome: emptiness claims the empty nodes, multi-node claims its batch
+	// before single-node walks.
+	for _, p := range []sim.Path{sim.PathEmpty, sim.PathMultiNode, sim.PathSingleNode} {
+		s := r.Paths[p]
+		f("         %-12s %5d candidates, %d proposals over %d nodes, $%.4f/hr",
+			p, s.Candidates, s.Proposals, s.Nodes, s.Savings)
+		if p == sim.PathMultiNode {
+			f("  (%d probes, batch %d)", s.Probes, s.BatchSize)
+		}
+		f("\n")
+	}
 	f("stage 3  compact      %5d committed, %d conflicts dropped   %s\n",
 		r.Committed, r.Conflicts, dur(r.CompactNanos))
 	f("stage 4  execute      %5d applied: %d proceed, %d stopped early  %s\n",
@@ -95,20 +108,31 @@ func report(seed int64, k float64, cfg sim.RunConfig, r sim.Result) string {
 // stopped_score is broken out of the cause histogram because it is the column a
 // sweep is about: how often a committed move had stopped paying by the time it
 // reached the executor.
+// The per-path columns are what let a sweep say which of the three produced a
+// savings figure. multi_batch and multi_probes are the binary search's own
+// numbers, which no aggregate can recover.
 const csvHeader = "nodes,seed,k,threshold,budget,candidates,destinations,proposals," +
 	"committed,conflicts,applied,proceeded,stopped,stopped_actions,stopped_score," +
 	"savings_proposed,savings_realized,cost_before,cost_after," +
-	"pending,budget_left,identify_ns,generate_ns,compact_ns,execute_ns"
+	"pending,budget_left,identify_ns,generate_ns,compact_ns,execute_ns," +
+	"empty_props,empty_nodes,empty_savings," +
+	"multi_props,multi_nodes,multi_savings,multi_probes,multi_batch," +
+	"single_props,single_nodes,single_savings"
 
 func csvRow(nodes int, seed int64, k float64, cfg sim.RunConfig, r sim.Result) string {
-	return fmt.Sprintf("%d,%d,%g,%g,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.6f,%.6f,%.6f,%.6f,%d,%d,%d,%d,%d,%d",
+	e, m, s := r.Paths[sim.PathEmpty], r.Paths[sim.PathMultiNode], r.Paths[sim.PathSingleNode]
+	return fmt.Sprintf("%d,%d,%g,%g,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.6f,%.6f,%.6f,%.6f,%d,%d,%d,%d,%d,%d"+
+		",%d,%d,%.6f,%d,%d,%.6f,%d,%d,%d,%d,%.6f",
 		nodes, seed, k, cfg.Threshold, cfg.Budget,
 		r.CandidatesOut, r.Destinations, r.ProposalsGenerated,
 		r.Committed, r.Conflicts, r.Applied, r.Proceeded,
 		r.Stopped, r.StoppedActions, r.StopCauses[sim.ScoreStillClears],
 		r.SavingsProposed, r.SavingsRealized, r.PoolCostBefore, r.PoolCostAfter,
 		r.PendingAfter, r.BudgetLeft,
-		r.IdentifyNanos, r.GenerateNanos, r.CompactNanos, r.ExecuteNanos)
+		r.IdentifyNanos, r.GenerateNanos, r.CompactNanos, r.ExecuteNanos,
+		e.Proposals, e.Nodes, e.Savings,
+		m.Proposals, m.Nodes, m.Savings, m.Probes, m.BatchSize,
+		s.Proposals, s.Nodes, s.Savings)
 }
 
 func pct(n, d int) float64 {
