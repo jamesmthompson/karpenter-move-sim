@@ -18,20 +18,33 @@ func TestRunReproducibleUnderFixedSeed(t *testing.T) {
 		got := Run(context.Background(), nodes, totals, cat, DefaultRunConfig(2, 20))
 		if i == 0 {
 			first = got
-			fmt.Printf("seed=1 committed=%d proceeded=%d rolled=%d proposed=%.4f realized=%.4f\n",
-				got.Committed, got.Proceeded, got.RolledBack, got.SavingsProposed, got.SavingsRealized)
+			fmt.Printf("seed=1 committed=%d proceeded=%d stopped=%d proposed=%.4f realized=%.4f\n",
+				got.Committed, got.Proceeded, got.Stopped, got.SavingsProposed, got.SavingsRealized)
 			continue
 		}
 		// Compare decisions only. Timing fields measure wall clock, so they
 		// differ by design.
+		// StopCauses is a map, so it cannot sit in a comparable struct. It is
+		// compared by kind below, which also pins which precondition did the
+		// stopping: two runs stopping the same count for different reasons are not
+		// the same run.
 		type decisions struct {
 			candidates, proposals, committed, conflicts int
-			applied, proceeded, rolled, forward         int
+			applied, proceeded, stopped, stoppedActions int
 			pending                                     int
 		}
 		d := func(r Result) decisions {
 			return decisions{r.CandidatesOut, r.ProposalsGenerated, r.Committed, r.Conflicts,
-				r.Applied, r.Proceeded, r.RolledBack, r.Forward, r.PendingAfter}
+				r.Applied, r.Proceeded, r.Stopped, r.StoppedActions, r.PendingAfter}
+		}
+		if len(got.StopCauses) != len(first.StopCauses) {
+			t.Fatalf("run %d stopped for %v, first for %v", i, got.StopCauses, first.StopCauses)
+		}
+		for kind, n := range first.StopCauses {
+			if got.StopCauses[kind] != n {
+				t.Fatalf("run %d stopped %d times on %s, first %d times",
+					i, got.StopCauses[kind], kind, n)
+			}
 		}
 		if d(got) != d(first) {
 			t.Fatalf("run %d diverged\n got:   %+v\n first: %+v", i, d(got), d(first))

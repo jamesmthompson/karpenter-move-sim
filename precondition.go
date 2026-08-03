@@ -7,12 +7,13 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
-// A precondition is a hard constraint: a predicate that flips rather than
-// drifts. Cost is smooth, so it is graded by Score. Constraints are not, so they
-// are gated here.
+// A precondition is a predicate that flips rather than drifts. The score itself
+// drifts, so it grades and ranks; its comparison against the approval threshold
+// flips, so that comparison is gated here alongside the hard constraints.
 //
-// The list is not arbitrary. It is the set of hard constraints, because a hard
-// constraint is by definition a predicate whose value jumps.
+// The list is not arbitrary. Every entry is something whose value jumps, which is
+// why re-checking it at apply time can change a verdict and re-reading a smooth
+// quantity cannot.
 type PreconditionKind int
 
 const (
@@ -68,6 +69,26 @@ const (
 	// same relation with the sign flipped. Added last so the constants above keep
 	// their values.
 	AffinityHolds
+
+	// ScoreStillClears: the move's score, recomputed against current inputs,
+	// still clears the approval threshold.
+	//
+	// The score itself drifts, so it grades. The comparison against the threshold
+	// does not: a move at 0.51 with a floor of 0.5 is approved and the same move at
+	// 0.49 is not. That comparison is a predicate that flips, which is what puts it
+	// here rather than leaving it in stage 2 alone.
+	//
+	// It is also what removes the need for a forward path. A move whose value
+	// decayed below the floor does not start, so there is no case where a proposal
+	// has to be finished as an obligation after its value went away.
+	//
+	// Measured: one node read per candidate per check, 4.8 reads per applied move
+	// at 1000 nodes against 4.7 for the PDB and 2156 for topology spread, and flat
+	// from 10 nodes to 1000. The inputs that move are the candidate's pods and its
+	// price, both on the node. The pool denominators are the cluster, and this
+	// check does not derive them; it carries the totals stage 3 was handed. See
+	// ScoreStillClearsChecker.
+	ScoreStillClears
 )
 
 // Local reports whether this precondition can be evaluated from one node's own
@@ -86,6 +107,13 @@ const (
 // PDB is local because the object carries its own availability. The count that
 // makes the answer is maintained by the PDB controller, and the eviction path
 // reads it rather than deriving it.
+//
+// The score is local for the same reason with a different supplier. Its numerator
+// is one node's pods and one node's price; its denominators are the pool, and the
+// pass computes those once rather than per check. So the answer is local only as
+// long as something else holds the totals, and that is stated rather than assumed:
+// carrying stale denominators across a pass is a real cost, and it is named in
+// ScoreStillClearsChecker.
 //
 // Topology spread is the one that stays non-local, and there is no status field to
 // read in place of the distribution. maxSkew is defined against the minimum count
@@ -108,6 +136,12 @@ func (p PreconditionKind) Local() bool {
 		return true
 	case AntiAffinityHolds, AffinityHolds:
 		// At hostname scope. See LocalForTopologyKey, which is the honest answer.
+		return true
+	case ScoreStillClears:
+		// One node per candidate. The pool denominators are cluster-wide and are
+		// carried forward from stage 3 rather than re-derived, so no read pays for
+		// them here. Deriving them instead would cost the cluster, which is the
+		// distinction ScoreStillClearsChecker's comment records.
 		return true
 	default:
 		return false
@@ -149,6 +183,8 @@ func (p PreconditionKind) String() string {
 		return "AffinityHolds"
 	case GangIntact:
 		return "GangIntact"
+	case ScoreStillClears:
+		return "ScoreStillClears"
 	}
 	return "unknown"
 }
@@ -162,8 +198,11 @@ type Checker interface {
 }
 
 // CheckAll evaluates every precondition a proposal declares, returning the
-// first violation. A violation means the move became illegal, so it is gated.
-// A move whose savings merely decayed is not a violation, and it proceeds.
+// first violation. A violation stops the move where it is. Actions already
+// applied stay applied, because each one leaves a state some controller already
+// handles: a tainted node is a node someone means to drain, an extra node is an
+// underutilized node consolidation reclaims, an evicted pod is a pending pod
+// provisioning places.
 func CheckAll(ctx context.Context, p Proposal, checkers map[PreconditionKind]Checker) error {
 	return CheckAllCounting(ctx, p, checkers, nil)
 }
@@ -185,37 +224,22 @@ func CheckAllCounting(ctx context.Context, p Proposal, checkers map[Precondition
 			reads[kind] += counting.Reads()
 		}
 		if err != nil {
-			return fmt.Errorf("precondition %s: %w", kind, err)
+			return &PreconditionViolation{Kind: kind, Err: err}
 		}
 	}
 	return nil
 }
 
-// Decide resolves a precondition or postcondition failure into an outcome.
-//
-// The boundary is whether the disruption has already been paid. Before the
-// first eviction nothing is destroyed, so rollback costs one wasted launch and
-// an untaint. After the first eviction the cost is sunk, and rolling back does
-// not un-evict anyone, so forward is the only path that gets the pods running.
-//
-// appliedIrreversible is true once any action with Reversible() == false has
-// fired.
-func Decide(appliedIrreversible bool) Outcome {
-	if appliedIrreversible {
-		return Forward
-	}
-	return Rollback
+// PreconditionViolation names which precondition stopped a move. The kind is
+// carried in a field rather than only in the message, so a pass can report what
+// its stops were caused by without parsing text.
+type PreconditionViolation struct {
+	Kind PreconditionKind
+	Err  error
 }
 
-// ForwardCost is unplanned disruption. A move that fails and goes forward does
-// work nobody scheduled, so it has to be charged against the budget.
-//
-// Open question, and the reason this is a named type rather than an int: if
-// forward work is not charged, a burst of failures can exceed the budget
-// without any single decision violating it. A budget that self-clears is more
-// permissive over time than a breaker that latches. A 10% pace resetting every
-// window churns the whole fleet in ten windows.
-type ForwardCost struct {
-	Nodes int
-	Pods  int
+func (v *PreconditionViolation) Error() string {
+	return fmt.Sprintf("precondition %s: %v", v.Kind, v.Err)
 }
+
+func (v *PreconditionViolation) Unwrap() error { return v.Err }

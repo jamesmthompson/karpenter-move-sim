@@ -60,6 +60,11 @@ func (g ConsolidationGenerator) Generate(n NodeSnapshot, dests []NodeSnapshot, c
 				{Kind: Taint, ProviderID: n.ProviderID},
 				{Kind: Delete, ProviderID: n.ProviderID, DependsOn: []int{0}},
 			},
+			// No ScoreStillClears. The empty branch never gated on the threshold
+			// in the first place, so re-checking one would refuse work this
+			// generator approved unconditionally. A node whose pods came back is
+			// caught by NoDoNotDisrupt and PodsStillFit on the next pass, where it
+			// is no longer empty and takes the scored path.
 			Preconditions: []PreconditionKind{NoDoNotDisrupt, BudgetHasRoom, NotNominated},
 			Reason:        ReasonEmpty,
 		})
@@ -250,7 +255,11 @@ func (c BandConfig) Classify(n NodeSnapshot, cat *Catalog, totals PoolTotals) Ba
 // does, so stage 2 stays local. Deciding a constraint takes the cluster; noticing
 // that a pod carries one does not.
 func consolidationPreconditions(n NodeSnapshot) []PreconditionKind {
-	pre := []PreconditionKind{PodsStillFit, NoDoNotDisrupt, BudgetHasRoom, NotNominated}
+	// ScoreStillClears is on every consolidation proposal, DELETE and REPLACE
+	// alike, because both are approved by the same comparison and either can decay
+	// past it between generation and apply. A provisioning proposal carries no
+	// score, so it does not declare this.
+	pre := []PreconditionKind{ScoreStillClears, PodsStillFit, NoDoNotDisrupt, BudgetHasRoom, NotNominated}
 	if len(n.ReschedulablePods) > 0 {
 		pre = append(pre, PDBAllows)
 	}

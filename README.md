@@ -76,8 +76,6 @@ Multi-node consolidation is not built. Upstream attempts multi-node before singl
 
 The compactor detects two proposals removing the same node. It cannot detect two proposals planning against the same free capacity on the same destination, because a proposal records what it removes and what it launches but nothing about the destinations its generator counted on. Those surface at apply time as a `PodsStillFit` failure.
 
-Stage 4 still carries `Decide`, `Rollback`, `Forward`, and `ForwardCost` from an execution model that has been dropped. A move that fails a precondition should stop where it is, since every intermediate state is one the system already handles.
-
 Placement is first-fit over sorted node IDs, not the Kubernetes scheduler. Adequate for measuring stage costs, wrong for anything claiming placement fidelity.
 
 ## Reproducibility

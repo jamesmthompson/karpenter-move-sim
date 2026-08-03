@@ -537,9 +537,9 @@ func TestRunPaysTheReadCost(t *testing.T) {
 		if res.Applied == 0 {
 			t.Fatalf("N=%d applied nothing; the pass measured no checks", size)
 		}
-		fmt.Printf("N=%d nodes, committed=%d applied=%d proceeded=%d rolled=%d forward=%d\n",
-			size, res.Committed, res.Applied, res.Proceeded, res.RolledBack, res.Forward)
-		for _, kind := range []PreconditionKind{PDBAllows, AntiAffinityHolds, AffinityHolds, TopologyHolds} {
+		fmt.Printf("N=%d nodes, committed=%d applied=%d proceeded=%d stopped=%d causes=%v\n",
+			size, res.Committed, res.Applied, res.Proceeded, res.Stopped, res.StopCauses)
+		for _, kind := range []PreconditionKind{ScoreStillClears, PDBAllows, AntiAffinityHolds, AffinityHolds, TopologyHolds} {
 			per := float64(res.NodeReads[kind]) / float64(res.Applied)
 			perMove[kind] = append(perMove[kind], per)
 			perMoveOverN[kind] = append(perMoveOverN[kind], per/float64(len(nodes)))
@@ -568,10 +568,25 @@ func TestRunPaysTheReadCost(t *testing.T) {
 		t.Errorf("spread reads per move went %.1f -> %.1f across N=100/1000; "+
 			"a non-local check should track cluster size", tsc[1], tsc[2])
 	}
+	// The score is the cheapest check in the set and the one Karpenter today pays
+	// the most for, because upstream answers it by re-deriving every candidate in
+	// the cluster. Here it is one read per candidate per check, so a couple of reads
+	// per move at any size. Asserted against the PDB rather than as an absolute,
+	// since the PDB is the check already established as flat.
+	score := perMove[ScoreStillClears]
+	if score[2] > 2*score[0] {
+		t.Errorf("score reads per move went %.1f -> %.1f -> %.1f across N=10/100/1000; "+
+			"recomputing one node's score is supposed to be flat", score[0], score[1], score[2])
+	}
+	if score[2] > 2*pdb[2] {
+		t.Errorf("the score costs %.1f reads per move against the PDB's %.1f at N=1000; "+
+			"it reads strictly less state than the PDB does", score[2], pdb[2])
+	}
+
 	// The gap is the claim. At N=1000 the non-local check costs two orders of
 	// magnitude more per move than any local one, and the local ones' share of the
 	// cluster fell by 10x from N=100 while spread's held.
-	for _, kind := range []PreconditionKind{PDBAllows, AntiAffinityHolds, AffinityHolds} {
+	for _, kind := range []PreconditionKind{ScoreStillClears, PDBAllows, AntiAffinityHolds, AffinityHolds} {
 		if perMove[kind][2] > tsc[2]/50 {
 			t.Errorf("%s costs %.1f reads per move against spread's %.1f at N=1000; "+
 				"the classification needs the gap", kind, perMove[kind][2], tsc[2])

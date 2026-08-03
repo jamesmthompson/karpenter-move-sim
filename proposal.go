@@ -166,22 +166,17 @@ type Action struct {
 type ActionKind int
 
 const (
-	// Taint cordons a node. Reversible: untaint restores the prior state.
+	// Taint cordons a node. Stopping here leaves a node someone means to drain.
 	Taint ActionKind = iota
-	// Launch creates a NodeClaim. Reversible before any pod moves.
+	// Launch creates a NodeClaim. Stopping here leaves an underutilized node,
+	// which is what consolidation reclaims.
 	Launch
-	// Evict removes a pod. THE FIRST IRREVERSIBLE ACTION. Once an Evict has
-	// fired, the disruption is paid and rollback recovers nothing.
+	// Evict removes a pod. Stopping here leaves a pending pod, which is what
+	// provisioning places.
 	Evict
-	// Delete removes a node. Irreversible.
+	// Delete removes a node. Stopping here leaves a smaller cluster.
 	Delete
 )
-
-// Reversible reports whether rolling back this action restores the prior state.
-// The rollback-or-forward boundary is the first action for which this is false.
-func (k ActionKind) Reversible() bool {
-	return k == Taint || k == Launch
-}
 
 // Proposal is a move that has not been applied. It carries its own score, its
 // preconditions, and a DAG of actions with dependency edges.
@@ -295,28 +290,34 @@ type Compactor interface {
 // Stage 4: execution
 // -----------------------------------------------------------------------------
 
-// Outcome is the three-way result of a postcondition check. A move can fail as
-// an optimization and still have to complete as an obligation.
+// Outcome is what became of one proposal. There are two answers because there
+// are two things that can happen: the actions all fired, or a precondition
+// stopped them.
 type Outcome int
 
 const (
-	// Proceed: postconditions hold, continue to the next action.
+	// Proceed: every precondition held through the last action.
 	Proceed Outcome = iota
-	// Rollback: undo applied actions. Only available while every applied
-	// action is reversible.
-	Rollback
-	// Forward: the disruption is paid, so finish getting the pods running even
-	// though the move no longer delivers what it claimed.
-	Forward
+	// Stopped: a precondition failed. Whatever had already fired stays.
+	Stopped
 )
+
+func (o Outcome) String() string {
+	if o == Stopped {
+		return "Stopped"
+	}
+	return "Proceed"
+}
 
 // Executor applies a proposal one action at a time. Its single guarantee is
 // ordering: release no action whose prerequisites are unconfirmed.
 //
-// It does not build compensation paths. A replacement node whose move stalled
-// halfway is an underutilized node, and consolidation already reclaims those.
+// It builds no unwind path and no compensation path, because every state an
+// action leaves behind is one the system already handles continuously. Ordering
+// is what survives: a later pass cannot recover the gap where pods are pending
+// because a node was deleted before its replacement was ready.
 type Executor interface {
-	// Apply walks the action DAG, checking preconditions before each action and
-	// postconditions after. It returns the outcome of the last decision made.
+	// Apply walks the action DAG, checking preconditions before each action. It
+	// returns whether the proposal ran out of actions or out of preconditions.
 	Apply(ctx context.Context, p Proposal) (Outcome, error)
 }

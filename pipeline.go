@@ -34,8 +34,8 @@ import (
 // types it launches, and nothing about the existing destinations its generator
 // counted on. The information is not in the type. Everything that survives to
 // apply time therefore falls to PodsStillFit, and a run where most committed
-// proposals roll back on PodsStillFit is that gap being measured rather than a
-// bug in the checker.
+// proposals stop on PodsStillFit is that gap being measured rather than a bug in
+// the checker.
 type RankingCompactor struct{}
 
 // Select satisfies Compactor. The conflict count is dropped, which is why
@@ -143,8 +143,8 @@ type ClusterNode struct {
 	Tainted bool
 	Deleted bool
 
-	// Launched marks a node this pass created. Rollback removes it; a node that
-	// was already there is not ours to delete.
+	// Launched marks a node this pass created, which is what distinguishes an
+	// extra node the pass is answerable for from one it inherited.
 	Launched bool
 }
 
@@ -179,10 +179,24 @@ type Cluster struct {
 	// that its score never charged it for.
 	Pending []*corev1.Pod
 
+	// Totals and Threshold are what ScoreStillClears compares against. They enter
+	// with the cluster because stage 3 is the first stage holding both: the pass's
+	// denominators and the approval floor stage 2 used.
+	//
+	// A zero Threshold is no floor, so a cluster built without these has an inert
+	// score check rather than a wrong one. Setting Threshold without Totals is the
+	// combination that fails loudly, which is the right way round.
+	Totals    PoolTotals
+	Threshold float64
+
 	launchSeq int
 }
 
 // NewCluster materializes the model from the same snapshots stages 1 and 2 read.
+//
+// It does not fill in Totals or Threshold. Both are stage-3 inputs the caller
+// already holds, and summing the pool here would put Totals' adversarial price
+// guard on a constructor that has no other reason to reject a cluster.
 func NewCluster(nodes []NodeSnapshot, cat *Catalog, budget int) *Cluster {
 	c := &Cluster{
 		Catalog:   cat,
@@ -251,7 +265,7 @@ func fitsInto(free, need corev1.ResourceList) bool {
 	return true
 }
 
-// Taint cordons a node. Reversible.
+// Taint cordons a node.
 func (c *Cluster) Taint(providerID string) error {
 	n, ok := c.Nodes[providerID]
 	if !ok || n.Deleted {
@@ -261,13 +275,7 @@ func (c *Cluster) Taint(providerID string) error {
 	return nil
 }
 
-func (c *Cluster) untaint(providerID string) {
-	if n, ok := c.Nodes[providerID]; ok {
-		n.Tainted = false
-	}
-}
-
-// Launch adds a node of the given type. Reversible until a pod lands on it.
+// Launch adds a node of the given type.
 func (c *Cluster) Launch(it *cloudprovider.InstanceType) (string, error) {
 	if it == nil {
 		return "", errors.New("launch: nil instance type")
@@ -288,9 +296,9 @@ func (c *Cluster) Launch(it *cloudprovider.InstanceType) (string, error) {
 	return id, nil
 }
 
-// Evict removes one pod from a node and places it wherever it fits. This is the
-// first irreversible action, and the reason is visible here: the pod's identity
-// on its old node is gone whether or not the placement succeeds.
+// Evict removes one pod from a node and places it wherever it fits. A pod with
+// nowhere to land becomes pending, which is the state provisioning already exists
+// to resolve.
 func (c *Cluster) Evict(providerID string, prefer string) error {
 	n, ok := c.Nodes[providerID]
 	if !ok || n.Deleted {
@@ -394,7 +402,79 @@ func LocalCheckers(c *Cluster) map[PreconditionKind]Checker {
 		AntiAffinityHolds: &PlacementChecker{Cluster: c, Constraint: AntiAffinityConstraint{}},
 		AffinityHolds:     &PlacementChecker{Cluster: c, Constraint: AffinityConstraint{}},
 		GangIntact:        unimplementedChecker{kind: GangIntact},
+		ScoreStillClears:  &ScoreStillClearsChecker{Cluster: c},
 	}
+}
+
+// ScoreStillClearsChecker recomputes the proposal's score against current inputs
+// and rejects it if the score no longer clears the threshold.
+//
+// This is the check that lets stage 4 stop a move instead of finishing one that
+// stopped paying. A move whose value decayed below the floor never fires its first
+// action, so there is no partly-applied move that has to be completed as an
+// obligation.
+//
+// What it reads is the point. The numerator's inputs are local: this node's pods,
+// which decide its disruption cost, and its price, which is a label on the node.
+// One node read per candidate, flat in cluster size.
+//
+// The denominators are not local. Pool cost and pool disruption cost are sums over
+// every node in the pool, and no status field carries either. This checker does not
+// derive them. It uses Cluster.Totals, which stage 3 was handed and which stages 1
+// and 2 already scored against, so the recheck compares a fresh numerator against
+// the same denominators the original approval used. That is deliberate and it is
+// not free of consequence: a pass that deletes nodes shrinks the real pool cost,
+// so late in a pass the denominators are stale by the savings the pass has already
+// realized. Refreshing them each time would cost one read of every node in the
+// pool per proposal, which is the cost this design exists to avoid, and it would
+// answer a question about one node by re-reading the cluster.
+type ScoreStillClearsChecker struct {
+	Cluster *Cluster
+
+	reads
+}
+
+func (k *ScoreStillClearsChecker) Kind() PreconditionKind { return ScoreStillClears }
+
+func (k *ScoreStillClearsChecker) Check(_ context.Context, p Proposal) error {
+	if p.Score == 0 && len(p.Candidates) == 0 {
+		// A pure launch carries no score. Nothing to compare.
+		return nil
+	}
+	r := k.begin(k.Cluster)
+
+	savings := 0.0
+	disruption := 0.0
+	for _, cand := range p.Candidates {
+		n, ok := r.Node(cand.ProviderID)
+		if !ok || n.Deleted {
+			// The node this move was about is gone, so the move is not worth
+			// anything. Whether that is a violation is decided by the total below,
+			// which is zero if every candidate vanished.
+			continue
+		}
+		k.evals++
+		savings += n.Price
+		disruption += RescheduleDisruptionCost(n.Pods)
+	}
+	// A REPLACE recovers the price difference, not the full price. Stage 2 priced
+	// the replacement from the catalog and prices do not move within a pass, so the
+	// replacement's price is subtracted from what the candidates give back.
+	for _, it := range p.Replacements {
+		if it == nil {
+			continue
+		}
+		if price, ok := cheapestOffering(it); ok {
+			savings -= price
+		}
+	}
+
+	score := Score(savings, disruption, k.Cluster.Totals)
+	if score < k.Cluster.Threshold {
+		return fmt.Errorf("score fell to %.4f, below the %.4f floor (was %.4f)",
+			score, k.Cluster.Threshold, p.Score)
+	}
+	return nil
 }
 
 // PodsStillFitChecker asks whether the candidates' remaining pods can be placed
@@ -552,24 +632,28 @@ func (k unimplementedChecker) Check(context.Context, Proposal) error { return ni
 // MemoryExecutor applies proposals against a Cluster.
 //
 // It carries counters because the numbers the paper needs are properties of the
-// apply loop and not of any one proposal: how often a move proceeds, how often
-// it rolls back for free, and how often it has to finish work that no longer
-// pays.
+// apply loop and not of any one proposal: how often a move runs to the end, and
+// how often a precondition stopped it partway.
 type MemoryExecutor struct {
 	Cluster  *Cluster
 	Checkers map[PreconditionKind]Checker
 
-	Proceeded  int
-	RolledBack int
-	Forwarded  int
+	Proceeded int
+	Stopped   int
 
-	// Forward is unplanned disruption, charged against the budget. See
-	// ForwardCost.
-	Forward ForwardCost
+	// ActionsApplied is how many actions fired inside proposals that stopped. A
+	// stop after zero actions costs nothing; a stop after an Evict left a pending
+	// pod. The two are different events and one counter cannot tell them apart.
+	ActionsApplied int
 
-	// Failures records the precondition error behind each non-Proceed outcome,
-	// in apply order.
+	// Failures records the violation behind each stop, in apply order. StopCauses
+	// aggregates them, since a list of errors is not a number anyone reports.
 	Failures []error
+
+	// StopCauses is stops per precondition. A pass where every stop is
+	// do-not-disrupt is a different pass from one where every stop is a capacity
+	// shortfall, and without this they print identically.
+	StopCauses map[PreconditionKind]int
 
 	// NodeReads is nodes read per precondition, summed over every Check the pass
 	// ran. It accumulates across proposals, so it is the pass's total cost for that
@@ -579,16 +663,11 @@ type MemoryExecutor struct {
 
 func NewMemoryExecutor(c *Cluster) *MemoryExecutor {
 	return &MemoryExecutor{
-		Cluster:   c,
-		Checkers:  LocalCheckers(c),
-		NodeReads: map[PreconditionKind]int{},
+		Cluster:    c,
+		Checkers:   LocalCheckers(c),
+		StopCauses: map[PreconditionKind]int{},
+		NodeReads:  map[PreconditionKind]int{},
 	}
-}
-
-// applied records one action that fired, so rollback knows what to undo.
-type applied struct {
-	kind       ActionKind
-	providerID string
 }
 
 // Apply walks the action DAG in order.
@@ -596,12 +675,10 @@ type applied struct {
 // A precondition failure is an outcome and not an error. The error return is for
 // faults in the mechanism itself: an action released before its prerequisites
 // confirmed, a missing checker, a write against a node that vanished. Conflating
-// the two would make a legal rollback indistinguishable from a bug.
+// the two would make a legal stop indistinguishable from a bug.
 func (e *MemoryExecutor) Apply(ctx context.Context, p Proposal) (Outcome, error) {
 	confirmed := map[int]bool{}
-	var log []applied
-	appliedIrreversible := false
-	evicted := 0
+	fired := 0
 	// replacement is the node this proposal launched, so its own evictions land
 	// on the capacity it bought.
 	replacement := ""
@@ -624,7 +701,17 @@ func (e *MemoryExecutor) Apply(ctx context.Context, p Proposal) (Outcome, error)
 		}
 
 		if err := CheckAllCounting(ctx, p, e.Checkers, e.NodeReads); err != nil {
-			return e.resolve(p, err, log, appliedIrreversible, evicted)
+			// Stop here. Nothing is undone, because each action already applied
+			// left a state the cluster handles on its own terms, and unwinding
+			// would be a second mechanism doing what the first does next pass.
+			e.Failures = append(e.Failures, err)
+			var v *PreconditionViolation
+			if errors.As(err, &v) {
+				e.StopCauses[v.Kind]++
+			}
+			e.Stopped++
+			e.ActionsApplied += fired
+			return Stopped, nil
 		}
 
 		switch a.Kind {
@@ -632,7 +719,6 @@ func (e *MemoryExecutor) Apply(ctx context.Context, p Proposal) (Outcome, error)
 			if err := e.Cluster.Taint(a.ProviderID); err != nil {
 				return Proceed, err
 			}
-			log = append(log, applied{kind: Taint, providerID: a.ProviderID})
 		case Launch:
 			id, err := e.Cluster.Launch(a.InstanceType)
 			if err != nil {
@@ -640,73 +726,22 @@ func (e *MemoryExecutor) Apply(ctx context.Context, p Proposal) (Outcome, error)
 			}
 			replacement = id
 			e.Cluster.LaunchesInFlight++
-			log = append(log, applied{kind: Launch, providerID: id})
 		case Evict:
 			if err := e.Cluster.Evict(a.ProviderID, replacement); err != nil {
 				return Proceed, err
 			}
-			evicted++
-			appliedIrreversible = true
-			log = append(log, applied{kind: Evict, providerID: a.ProviderID})
 		case Delete:
 			if err := e.Cluster.Delete(a.ProviderID); err != nil {
 				return Proceed, err
 			}
 			e.Cluster.Budget--
-			appliedIrreversible = true
-			log = append(log, applied{kind: Delete, providerID: a.ProviderID})
 		}
+		fired++
 		confirmed[i] = true
 	}
 
 	e.Proceeded++
 	return Proceed, nil
-}
-
-// resolve turns a precondition failure into an outcome and carries it out. The
-// cut lands at the first irreversible action, which Decide reads off
-// appliedIrreversible.
-func (e *MemoryExecutor) resolve(p Proposal, cause error, log []applied, appliedIrreversible bool, evicted int) (Outcome, error) {
-	e.Failures = append(e.Failures, cause)
-	switch Decide(appliedIrreversible) {
-	case Rollback:
-		// Undo in reverse, which matters for a taint-then-launch pair only in
-		// that it is the order that reads correctly in the log.
-		for i := len(log) - 1; i >= 0; i-- {
-			switch log[i].kind {
-			case Taint:
-				e.Cluster.untaint(log[i].providerID)
-			case Launch:
-				delete(e.Cluster.Nodes, log[i].providerID)
-			}
-		}
-		e.RolledBack++
-		return Rollback, nil
-	default:
-		// Forward. Finish the actions that get the pods running and skip the
-		// rest. Deleting the source is what releases its remaining pods to be
-		// rescheduled, so it stays; a further Launch would buy capacity the
-		// proposal never priced, so it does not.
-		for _, a := range p.Actions {
-			switch a.Kind {
-			case Evict:
-				_ = e.Cluster.Evict(a.ProviderID, "")
-				evicted++
-			case Delete:
-				if err := e.Cluster.Delete(a.ProviderID); err == nil {
-					e.Cluster.Budget--
-				}
-			}
-		}
-		e.Forwarded++
-		e.Forward.Nodes += len(p.Candidates)
-		e.Forward.Pods += evicted
-		// Charge the unplanned work. A budget that does not see forward work
-		// lets a burst of failures exceed the limit with every single decision
-		// inside it.
-		e.Cluster.Budget -= len(p.Candidates)
-		return Forward, nil
-	}
 }
 
 // -----------------------------------------------------------------------------
@@ -776,11 +811,21 @@ type Result struct {
 	Committed          int
 	Conflicts          int
 
-	Applied     int
-	Proceeded   int
-	RolledBack  int
-	Forward     int
-	ForwardCost ForwardCost
+	Applied   int
+	Proceeded int
+
+	// Stopped is committed proposals a precondition halted partway. What was
+	// already applied stayed applied, so a stop is not a no-op and the actions
+	// behind it are counted separately.
+	Stopped int
+
+	// StoppedActions is how many actions fired inside the stopped proposals.
+	StoppedActions int
+
+	// StopCauses is which precondition did the stopping, counted per kind. A pass
+	// that stops ten moves on capacity is a different pass from one that stops ten
+	// on do-not-disrupt.
+	StopCauses map[PreconditionKind]int
 
 	// SavingsProposed is the claimed hourly savings of the committed proposals.
 	// Stage 2 emits one move per candidate, so summing generated proposals would
@@ -789,8 +834,8 @@ type Result struct {
 
 	// SavingsRealized is measured from the cluster: pool cost before minus pool
 	// cost after. It charges for launched replacements and gives no credit for a
-	// move that went forward without delivering, which is what makes it differ
-	// from SavingsProposed.
+	// move that stopped before deleting its candidate, which is what makes it
+	// differ from SavingsProposed.
 	SavingsRealized float64
 
 	PoolCostBefore float64
@@ -846,6 +891,11 @@ func Run(ctx context.Context, nodes []NodeSnapshot, totals PoolTotals, cat *Cata
 
 	// Stage 3. Cluster state enters here.
 	cluster := NewCluster(nodes, cat, cfg.Budget)
+	// The denominators and the floor stage 2 approved against, carried forward so
+	// ScoreStillClears compares a fresh numerator against the same scale rather
+	// than re-summing the pool per proposal.
+	cluster.Totals = totals
+	cluster.Threshold = cfg.Threshold
 	markNominated(cluster, nodes, cfg.NominateEvery)
 	// Indexing walks every pod, which is the PDB controller's cost. It runs here
 	// rather than inside a checker so the checker's read count is the eviction
@@ -878,14 +928,26 @@ func Run(ctx context.Context, nodes []NodeSnapshot, totals PoolTotals, cat *Cata
 	res.NodeReads = exec.NodeReads
 
 	res.Proceeded = exec.Proceeded
-	res.RolledBack = exec.RolledBack
-	res.Forward = exec.Forwarded
-	res.ForwardCost = exec.Forward
+	res.Stopped = exec.Stopped
+	res.StoppedActions = exec.ActionsApplied
+	res.StopCauses = exec.StopCauses
 	res.PoolCostAfter = cluster.Cost()
 	res.SavingsRealized = res.PoolCostBefore - res.PoolCostAfter
 	res.PendingAfter = len(cluster.Pending)
 	res.BudgetLeft = cluster.Budget
 	return res
+}
+
+// StopCausesSorted lists the preconditions that stopped something, ordered by
+// kind. Go map order is random, so a report built by ranging StopCauses would not
+// reproduce between runs.
+func (r Result) StopCausesSorted() []PreconditionKind {
+	kinds := make([]PreconditionKind, 0, len(r.StopCauses))
+	for k := range r.StopCauses {
+		kinds = append(kinds, k)
+	}
+	sort.Slice(kinds, func(i, j int) bool { return kinds[i] < kinds[j] })
+	return kinds
 }
 
 // withoutNode drops the source from its own destination set. A node cannot

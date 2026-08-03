@@ -2,6 +2,7 @@ package sim
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 
@@ -302,10 +303,15 @@ func TestCompactorConflictsAndBudget(t *testing.T) {
 // Stage 4
 // -----------------------------------------------------------------------------
 
-// TestExecutorOutcomes drives the rollback-or-forward cut. Both cases use the
-// same proposal shape and differ only in where the failing precondition sits
-// relative to the first Evict, which is the whole of what Decide reads.
-func TestExecutorOutcomes(t *testing.T) {
+// TestExecutorStopsInPlace is what the three cases below used to assert about
+// rollback and forward. There is no cut now, so the three differ only in how far
+// the move got, and the assertion in every one of them is the same: whatever fired
+// is still there and nothing after it fired.
+//
+// This is the substantive change. The old test asserted that a pre-eviction
+// failure restored the prior state and a post-eviction failure completed the move.
+// Both are now wrong: the executor does neither.
+func TestExecutorStopsInPlace(t *testing.T) {
 	cat := BuildCatalog()
 
 	// failAfter is a checker that passes a set number of times and then fails.
@@ -318,42 +324,40 @@ func TestExecutorOutcomes(t *testing.T) {
 
 	cases := []struct {
 		name string
-		// passes before the checker starts failing.
-		passes      int
-		wantOutcome Outcome
-		wantEvicted bool
-		// wantLaunched is whether the Launch fired before the failure, so the
-		// rollback has a node to remove. At passes=0 nothing has been applied
-		// and the launched-node assertion below would hold vacuously.
+		// passes before the checker starts failing. The check runs once per
+		// action, so passes is also how many actions fired.
+		passes int
+		// what the cluster should look like at the stop.
+		wantTainted  bool
 		wantLaunched bool
+		wantPodsLeft int
+		wantDeleted  bool
 	}{
 		{
-			// The check runs before action 0, so nothing has been applied and
-			// nothing is destroyed. Rollback is free and correct.
-			name:        "rollback when a precondition fails before any eviction",
-			passes:      0,
-			wantOutcome: Rollback,
-			wantEvicted: false,
+			// The check runs before action 0, so the move never starts. This is
+			// the case the score precondition exists to produce: a move that
+			// stopped paying does no work at all.
+			name:         "a failure before the first action applies nothing",
+			passes:       0,
+			wantPodsLeft: 2,
 		},
 		{
-			// Taint and Launch applied, then the check fails before the first
-			// Evict. This is the case that costs something to roll back: a
-			// wasted CreateFleet and a node that has to go away again.
-			name:         "rollback undoes a launch that fired before the failure",
+			// Taint and Launch fired. The node stays launched, because an extra
+			// node is an underutilized node and consolidation reclaims those.
+			name:         "a failure after the launch leaves the node standing",
 			passes:       2,
-			wantOutcome:  Rollback,
-			wantEvicted:  false,
+			wantTainted:  true,
 			wantLaunched: true,
+			wantPodsLeft: 2,
 		},
 		{
-			// Taint, Launch, Evict, then the check fails. The pod is off its
-			// node and rolling back does not put it back, so the move has to
-			// finish as an obligation.
-			name:         "forward when a precondition fails after an eviction",
+			// Taint, Launch, one Evict. The pod stays where the eviction put it,
+			// the second pod stays on the source, and the source is not deleted.
+			name:         "a failure after an eviction does not finish the move",
 			passes:       3,
-			wantOutcome:  Forward,
-			wantEvicted:  true,
+			wantTainted:  true,
 			wantLaunched: true,
+			wantPodsLeft: 1,
 		},
 	}
 
@@ -369,8 +373,7 @@ func TestExecutorOutcomes(t *testing.T) {
 			check := newFailAfter(tc.passes)
 			exec.Checkers[NotNominated] = check
 
-			// A replace: taint, launch, evict, evict, delete. The launch is
-			// what makes a pre-eviction rollback have something to undo.
+			// A replace: taint, launch, evict, evict, delete.
 			replacement := instanceType(t, cat, "m7i.large")
 			p := Proposal{
 				Candidates:   []NodeSnapshot{source},
@@ -390,8 +393,8 @@ func TestExecutorOutcomes(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Apply returned a mechanism error: %v", err)
 			}
-			if got != tc.wantOutcome {
-				t.Fatalf("want outcome %v, got %v", tc.wantOutcome, got)
+			if got != Stopped {
+				t.Fatalf("want the move to stop, got %v", got)
 			}
 
 			// The failure has to land where the case intends, or the assertions
@@ -401,58 +404,54 @@ func TestExecutorOutcomes(t *testing.T) {
 				t.Fatalf("want the check to fail on call %d, it was called %d times",
 					tc.passes+1, check.calls)
 			}
-			if tc.wantLaunched && cluster.launchSeq != 1 {
-				t.Fatalf("case expects the launch to have fired, launchSeq=%d", cluster.launchSeq)
+			if exec.Stopped != 1 {
+				t.Errorf("want Stopped=1, got %d", exec.Stopped)
+			}
+			// The number of actions that fired is the stop's cost, and it is the
+			// count the pass reports.
+			if exec.ActionsApplied != tc.passes {
+				t.Errorf("want %d actions applied before the stop, got %d",
+					tc.passes, exec.ActionsApplied)
+			}
+			if exec.StopCauses[NotNominated] != 1 {
+				t.Errorf("want the stop attributed to NotNominated, got %v", exec.StopCauses)
 			}
 
 			src := cluster.Nodes[source.ProviderID]
-			switch tc.wantOutcome {
-			case Rollback:
-				if src.Tainted {
-					t.Error("rollback left the source tainted")
-				}
-				if src.Deleted {
-					t.Error("rollback deleted the source")
-				}
-				if len(src.Pods) != 2 {
-					t.Errorf("rollback lost pods: want 2 on the source, got %d", len(src.Pods))
-				}
-				// The launched node is the one reversible write that costs
-				// money, so a rollback that leaves it standing has not rolled
-				// back. Counting nodes catches it even if Launched were wrong.
-				if len(cluster.Nodes) != len(nodes) {
-					t.Errorf("rollback left %d nodes, want %d", len(cluster.Nodes), len(nodes))
-				}
-				for id, n := range cluster.Nodes {
-					if n.Launched {
-						t.Errorf("rollback left launched node %s standing", id)
-					}
-				}
-				if exec.RolledBack != 1 {
-					t.Errorf("want RolledBack=1, got %d", exec.RolledBack)
-				}
-				if exec.Forward.Pods != 0 {
-					t.Errorf("rollback should charge no forward cost, got %d pods", exec.Forward.Pods)
-				}
-			case Forward:
-				if !src.Deleted {
-					t.Error("forward left the source standing")
-				}
-				if len(src.Pods) != 0 {
-					t.Errorf("forward left %d pods on a deleted node", len(src.Pods))
-				}
-				if exec.Forwarded != 1 {
-					t.Errorf("want Forwarded=1, got %d", exec.Forwarded)
-				}
-				if exec.Forward.Pods == 0 {
-					t.Error("forward charged no pods against the budget")
-				}
-				if exec.Forward.Nodes != 1 {
-					t.Errorf("want 1 forward node charged, got %d", exec.Forward.Nodes)
+			// Every applied action stays applied. A taint that survives is a node
+			// someone means to drain, which is a state the cluster already handles.
+			if src.Tainted != tc.wantTainted {
+				t.Errorf("source tainted=%v, want %v", src.Tainted, tc.wantTainted)
+			}
+			if src.Deleted != tc.wantDeleted {
+				t.Errorf("source deleted=%v, want %v", src.Deleted, tc.wantDeleted)
+			}
+			if len(src.Pods) != tc.wantPodsLeft {
+				t.Errorf("source holds %d pods, want %d", len(src.Pods), tc.wantPodsLeft)
+			}
+			launched := 0
+			for _, n := range cluster.Nodes {
+				if n.Launched {
+					launched++
 				}
 			}
-			if tc.wantEvicted && exec.Forward.Pods == 0 {
-				t.Error("expected evictions to have been charged")
+			want := 0
+			if tc.wantLaunched {
+				want = 1
+			}
+			if launched != want {
+				t.Errorf("%d launched nodes standing, want %d", launched, want)
+			}
+			// No pod is lost. An evicted pod is either placed or pending, and
+			// either way it is still in the model.
+			total := len(cluster.Pending)
+			for _, n := range cluster.Nodes {
+				if !n.Deleted {
+					total += len(n.Pods)
+				}
+			}
+			if total != 2 {
+				t.Errorf("%d pods accounted for, want 2", total)
 			}
 		})
 	}
@@ -504,6 +503,143 @@ func TestExecutorOrdering(t *testing.T) {
 	}
 	if cluster.Nodes[source.ProviderID].Deleted {
 		t.Error("a rejected DAG should not have deleted anything")
+	}
+}
+
+// TestScoreStillClears is the score as a gate rather than a grade. The proposal
+// was approved against the pods stage 2 saw; the check is run against the pods on
+// the node now.
+func TestScoreStillClears(t *testing.T) {
+	cat := BuildCatalog()
+
+	// Two nodes at the same price, so the source's savings fraction is half the
+	// pool and its score is decided by its share of the pool's disruption cost.
+	source := node(t, cat, "i-src", "m7i.2xlarge", testPod("p1", 500, 1024))
+	other := node(t, cat, "i-other", "m7i.2xlarge",
+		testPod("o1", 500, 1024), testPod("o2", 500, 1024))
+	nodes := []NodeSnapshot{source, other}
+	totals := Totals(nodes)
+
+	cluster := NewCluster(nodes, cat, 10)
+	cluster.Totals = totals
+	cluster.Threshold = 0.5
+	check := &ScoreStillClearsChecker{Cluster: cluster}
+
+	p := Proposal{
+		Candidates: []NodeSnapshot{source},
+		Savings:    source.Price,
+		Score:      Score(source.Price, source.DisruptionCost, totals),
+	}
+	if p.Score < cluster.Threshold {
+		t.Fatalf("fixture broken: the proposal starts below the floor at %.4f", p.Score)
+	}
+	if err := check.Check(context.Background(), p); err != nil {
+		t.Errorf("the check rejected a move whose inputs did not move: %v", err)
+	}
+	// One node read per candidate. Recomputing the pool denominators here would
+	// make this the cluster.
+	if got := check.Reads(); got != 1 {
+		t.Errorf("the check read %d nodes for a one-candidate move, want 1", got)
+	}
+
+	// Pods arrive on the source. Savings is unchanged, since the node's price did
+	// not move, but its disruption cost grew, so the same move now buys the same
+	// dollars for more churn and the score falls.
+	for i := 0; i < 12; i++ {
+		cluster.Nodes[source.ProviderID].Pods = append(
+			cluster.Nodes[source.ProviderID].Pods, testPod(fmt.Sprintf("late%d", i), 100, 256))
+	}
+	if err := check.Check(context.Background(), p); err == nil {
+		t.Error("the score fell below the floor and the check approved the move anyway")
+	}
+
+	// A REPLACE recovers the price difference and not the full price, so the check
+	// has to subtract the replacement or it approves a move on a number stage 2
+	// never claimed.
+	bare := node(t, cat, "i-bare", "m7i.2xlarge", testPod("b1", 500, 1024))
+	rc := NewCluster([]NodeSnapshot{bare, other}, cat, 10)
+	rc.Totals = Totals([]NodeSnapshot{bare, other})
+	rc.Threshold = 0.5
+	sameSize := instanceType(t, cat, "m7i.2xlarge")
+	rep := Proposal{
+		Candidates:   []NodeSnapshot{bare},
+		Replacements: []*cloudprovider.InstanceType{sameSize},
+	}
+	// A replacement of the same type saves nothing, so the score is zero whatever
+	// the source's own numbers say.
+	if err := (&ScoreStillClearsChecker{Cluster: rc}).Check(context.Background(), rep); err == nil {
+		t.Error("a REPLACE with the same instance type saves nothing and should not clear")
+	}
+
+	// A pure launch carries no score, so there is nothing for this check to
+	// compare and it must not invent a verdict.
+	launch := Proposal{Replacements: []*cloudprovider.InstanceType{sameSize}}
+	if err := (&ScoreStillClearsChecker{Cluster: rc}).Check(context.Background(), launch); err != nil {
+		t.Errorf("a provisioning proposal has no score to check, got %v", err)
+	}
+}
+
+// Every consolidation proposal declares ScoreStillClears, DELETE and REPLACE
+// alike, and no provisioning proposal does. A move that is not gated on its own
+// score is a move that can apply after it stopped paying.
+func TestConsolidationProposalsGateOnScore(t *testing.T) {
+	cat := BuildCatalog()
+
+	declares := func(p Proposal) bool {
+		for _, pre := range p.Preconditions {
+			if pre == ScoreStillClears {
+				return true
+			}
+		}
+		return false
+	}
+
+	// The loose fixture yields DELETEs.
+	nodes, totals := GenCluster(GenClusterOpts{NodeCount: 100, Seed: 7, Catalog: cat})
+	cfg := DefaultRunConfig(2, 20)
+	gen := ConsolidationGenerator{Threshold: cfg.Threshold}
+	dests := EligibleDestinations(nodes, cat, totals, cfg.Bands)
+	deletes := 0
+	for _, n := range nodes {
+		for _, p := range gen.Generate(n, withoutNode(dests, n.ProviderID), cat, totals) {
+			if p.Reason == ReasonEmpty {
+				// The empty branch never gated on the threshold, so re-checking one
+				// would refuse work the generator approved unconditionally.
+				if declares(p) {
+					t.Errorf("%s: an empty delete was never score-gated", p.ID)
+				}
+				continue
+			}
+			deletes++
+			if !declares(p) {
+				t.Errorf("%s does not declare ScoreStillClears", p.ID)
+			}
+		}
+	}
+	if deletes == 0 {
+		t.Fatal("the loose fixture produced no scored consolidation proposals")
+	}
+
+	// The tight fixture is where a REPLACE is the only move.
+	tn, tt, tcat, tcfg := tightRun(t)
+	_, replaces := splitByKind(generateFor(tn, tt, tcat, tcfg, OversizedProviderID))
+	if len(replaces) != 1 {
+		t.Fatalf("want one REPLACE from the tight fixture, got %d", len(replaces))
+	}
+	if !declares(replaces[0]) {
+		t.Error("the REPLACE does not declare ScoreStillClears")
+	}
+
+	// Provisioning has no score, so there is nothing to gate.
+	pending := []*corev1.Pod{testPod("pend1", 500, 1024), testPod("pend2", 500, 1024)}
+	provs := ProvisioningGenerator{}.Generate(pending, cat)
+	if len(provs) == 0 {
+		t.Fatal("the provisioning generator produced nothing to check")
+	}
+	for _, p := range provs {
+		if declares(p) {
+			t.Errorf("%s declares ScoreStillClears, but a launch has no score", p.ID)
+		}
 	}
 }
 
@@ -586,7 +722,7 @@ func TestCheckers(t *testing.T) {
 	// is the classification readcost_test.go measures, so the two cannot drift
 	// apart without one of them failing.
 	t.Run("relational constraints are classified as measured", func(t *testing.T) {
-		for _, kind := range []PreconditionKind{PDBAllows, AntiAffinityHolds, AffinityHolds} {
+		for _, kind := range []PreconditionKind{PDBAllows, AntiAffinityHolds, AffinityHolds, ScoreStillClears} {
 			if !kind.Local() {
 				t.Errorf("%s measures local; see TestNodeReadsPerCheck", kind)
 			}
@@ -716,9 +852,21 @@ func TestRunEndToEnd(t *testing.T) {
 	if res.CandidatesOut > res.NodesIn {
 		t.Errorf("stage 1 emitted %d candidates from %d nodes", res.CandidatesOut, res.NodesIn)
 	}
-	if res.Applied != res.Proceeded+res.RolledBack+res.Forward {
-		t.Errorf("applied %d != proceed %d + rollback %d + forward %d",
-			res.Applied, res.Proceeded, res.RolledBack, res.Forward)
+	// Two outcomes and nothing else. A proposal either ran out of actions or out
+	// of preconditions.
+	if res.Applied != res.Proceeded+res.Stopped {
+		t.Errorf("applied %d != proceed %d + stopped %d",
+			res.Applied, res.Proceeded, res.Stopped)
+	}
+	// Every stop is attributed, or the cause histogram is not reporting the pass
+	// it claims to.
+	attributed := 0
+	for _, n := range res.StopCauses {
+		attributed += n
+	}
+	if attributed != res.Stopped {
+		t.Errorf("%d stops attributed to a precondition, %d stops happened",
+			attributed, res.Stopped)
 	}
 	if res.Applied > res.Committed {
 		t.Errorf("applied %d exceeds committed %d", res.Applied, res.Committed)

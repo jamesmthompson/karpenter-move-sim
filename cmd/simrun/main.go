@@ -74,31 +74,39 @@ func report(seed int64, k float64, cfg sim.RunConfig, r sim.Result) string {
 		r.Destinations, r.ProposalsGenerated, dur(r.GenerateNanos))
 	f("stage 3  compact      %5d committed, %d conflicts dropped   %s\n",
 		r.Committed, r.Conflicts, dur(r.CompactNanos))
-	f("stage 4  execute      %5d applied: %d proceed, %d rollback, %d forward  %s\n",
-		r.Applied, r.Proceeded, r.RolledBack, r.Forward, dur(r.ExecuteNanos))
+	f("stage 4  execute      %5d applied: %d proceed, %d stopped early  %s\n",
+		r.Applied, r.Proceeded, r.Stopped, dur(r.ExecuteNanos))
+	// Which precondition stopped them, because a pass stopping on capacity and a
+	// pass stopping on do-not-disrupt otherwise print the same.
+	for _, kind := range r.StopCausesSorted() {
+		f("         stopped by %-18s %d\n", kind, r.StopCauses[kind])
+	}
 	f("\n")
 	f("savings proposed  $%8.4f/hr\n", r.SavingsProposed)
 	f("savings realized  $%8.4f/hr  (%.1f%% of proposed)\n",
 		r.SavingsRealized, ratioPct(r.SavingsRealized, r.SavingsProposed))
 	f("pool cost         $%8.4f/hr -> $%.4f/hr\n", r.PoolCostBefore, r.PoolCostAfter)
-	f("forward cost       %d nodes, %d pods unplanned\n", r.ForwardCost.Nodes, r.ForwardCost.Pods)
+	f("stopped work       %d actions applied inside stopped proposals\n", r.StoppedActions)
 	f("pods stranded      %d\n", r.PendingAfter)
 	f("budget left        %d of %d\n", r.BudgetLeft, cfg.Budget)
 	return b.String()
 }
 
+// stopped_score is broken out of the cause histogram because it is the column a
+// sweep is about: how often a committed move had stopped paying by the time it
+// reached the executor.
 const csvHeader = "nodes,seed,k,threshold,budget,candidates,destinations,proposals," +
-	"committed,conflicts,applied,proceeded,rolled_back,forward," +
-	"savings_proposed,savings_realized,cost_before,cost_after,forward_nodes,forward_pods," +
+	"committed,conflicts,applied,proceeded,stopped,stopped_actions,stopped_score," +
+	"savings_proposed,savings_realized,cost_before,cost_after," +
 	"pending,budget_left,identify_ns,generate_ns,compact_ns,execute_ns"
 
 func csvRow(nodes int, seed int64, k float64, cfg sim.RunConfig, r sim.Result) string {
-	return fmt.Sprintf("%d,%d,%g,%g,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.6f,%.6f,%.6f,%.6f,%d,%d,%d,%d,%d,%d,%d,%d",
+	return fmt.Sprintf("%d,%d,%g,%g,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.6f,%.6f,%.6f,%.6f,%d,%d,%d,%d,%d,%d",
 		nodes, seed, k, cfg.Threshold, cfg.Budget,
 		r.CandidatesOut, r.Destinations, r.ProposalsGenerated,
-		r.Committed, r.Conflicts, r.Applied, r.Proceeded, r.RolledBack, r.Forward,
+		r.Committed, r.Conflicts, r.Applied, r.Proceeded,
+		r.Stopped, r.StoppedActions, r.StopCauses[sim.ScoreStillClears],
 		r.SavingsProposed, r.SavingsRealized, r.PoolCostBefore, r.PoolCostAfter,
-		r.ForwardCost.Nodes, r.ForwardCost.Pods,
 		r.PendingAfter, r.BudgetLeft,
 		r.IdentifyNanos, r.GenerateNanos, r.CompactNanos, r.ExecuteNanos)
 }

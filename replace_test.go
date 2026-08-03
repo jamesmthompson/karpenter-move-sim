@@ -130,14 +130,14 @@ func TestTightClusterYieldsReplaceNotDelete(t *testing.T) {
 
 // TestReplaceCommitsAndRealizesSavings is the assertion that would have caught
 // 0-of-4632. Generation is not the claim. The claim is that the move survives the
-// compactor, applies without rolling back, strands no pods, and leaves the pool
+// compactor, applies without stopping, strands no pods, and leaves the pool
 // measurably cheaper.
 func TestReplaceCommitsAndRealizesSavings(t *testing.T) {
 	nodes, totals, cat, cfg := tightRun(t)
 	res := Run(context.Background(), nodes, totals, cat, cfg)
 
-	fmt.Printf("tight run: proposals=%d committed=%d proceeded=%d rolled=%d forward=%d\n",
-		res.ProposalsGenerated, res.Committed, res.Proceeded, res.RolledBack, res.Forward)
+	fmt.Printf("tight run: proposals=%d committed=%d proceeded=%d stopped=%d\n",
+		res.ProposalsGenerated, res.Committed, res.Proceeded, res.Stopped)
 	fmt.Printf("pool cost $%.4f -> $%.4f, realized $%.4f/hr\n",
 		res.PoolCostBefore, res.PoolCostAfter, res.SavingsRealized)
 
@@ -145,8 +145,8 @@ func TestReplaceCommitsAndRealizesSavings(t *testing.T) {
 		t.Fatalf("want one committed proposal, got %d", res.Committed)
 	}
 	if res.Proceeded != 1 {
-		t.Errorf("want the REPLACE to proceed, got proceeded=%d rolled=%d forward=%d",
-			res.Proceeded, res.RolledBack, res.Forward)
+		t.Errorf("want the REPLACE to proceed, got proceeded=%d stopped=%d causes=%v",
+			res.Proceeded, res.Stopped, res.StopCauses)
 	}
 	// Realized savings is measured from the cluster, so it charges for the node
 	// the REPLACE launched. Proposed savings is what stage 2 claimed. A REPLACE
