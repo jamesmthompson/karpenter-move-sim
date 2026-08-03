@@ -156,6 +156,17 @@ type Cluster struct {
 	Catalog *Catalog
 	Nodes   map[string]*ClusterNode
 
+	// Placement is the scheduler scoring strategy that decides which of the nodes
+	// a pod fits on it actually lands on. It is one field on the cluster rather
+	// than an argument to each placement, because it is a configuration of the
+	// scheduler and not a property of a pod: a cluster where half the pods spread
+	// and half pack is not a cluster anyone runs, and a per-call choice would let
+	// the feasibility check and the executor answer differently about the same pod.
+	//
+	// Nil is first-fit, so a Cluster built by NewCluster and never configured
+	// places pods the way this simulator always did. See placement.go.
+	Placement PlacementStrategy
+
 	// Nominated nodes are reserved for a pending pod the scheduler already
 	// aimed at them. Draining one strands that pod.
 	Nominated map[string]bool
@@ -337,11 +348,20 @@ func (c *Cluster) Evict(providerID string, prefer string) error {
 	return nil
 }
 
-// placement is the scheduler stand-in: first fit over untainted nodes, with the
-// proposal's own replacement preferred so a REPLACE lands its pods where it
-// planned to. Iteration is over a sorted key list because Go map order is
-// random and a simulator that reorders placements between runs is not
-// reproducible.
+// placement is the scheduler stand-in: score every untainted node the pod fits
+// on and take the best, with the proposal's own replacement preferred so a
+// REPLACE lands its pods where it planned to.
+//
+// Iteration is over a sorted key list because Go map order is random, and the
+// order still matters even with scoring: the scorers truncate to integers, so
+// most candidates tie, and Pick keeps the lowest index on a tie. A simulator that
+// reorders placements between runs is not reproducible.
+//
+// The preference is checked before scoring rather than folded into it. A REPLACE
+// bought a specific node for these specific pods, and a strategy that sent them
+// elsewhere would leave the node it just launched empty and make the proposal's
+// own savings arithmetic wrong. That is a plan the executor is carrying out, not
+// a placement decision it is making.
 func (c *Cluster) placement(pod *corev1.Pod, exclude, prefer string) (*ClusterNode, bool) {
 	need := podNeeds(pod)
 	if prefer != "" {
@@ -349,16 +369,38 @@ func (c *Cluster) placement(pod *corev1.Pod, exclude, prefer string) (*ClusterNo
 			return n, true
 		}
 	}
+	candidates := make([]*ClusterNode, 0, len(c.Nodes))
+	slots := make([]Slot, 0, len(c.Nodes))
 	for _, id := range c.sortedIDs() {
 		n := c.Nodes[id]
 		if id == exclude || n.Deleted || n.Tainted {
 			continue
 		}
-		if fitsInto(c.free(n), need) {
-			return n, true
-		}
+		candidates = append(candidates, n)
+		slots = append(slots, c.slotFor(n))
 	}
-	return nil, false
+	i, ok := Pick(c.strategy(), slots, need)
+	if !ok {
+		return nil, false
+	}
+	return candidates[i], true
+}
+
+// strategy is the cluster's placement strategy, defaulting to first fit.
+func (c *Cluster) strategy() PlacementStrategy {
+	if c.Placement == nil {
+		return FirstFit()
+	}
+	return c.Placement
+}
+
+// slotFor reduces a standing node to what scoring needs.
+func (c *Cluster) slotFor(n *ClusterNode) Slot {
+	alloc := corev1.ResourceList{}
+	if n.InstanceType != nil {
+		alloc = c.Catalog.Effective(n.InstanceType)
+	}
+	return Slot{Free: c.free(n), Allocatable: alloc}
 }
 
 func (c *Cluster) sortedIDs() []string {
@@ -525,7 +567,7 @@ func (k PodsStillFitChecker) Check(_ context.Context, p Proposal) error {
 	// The proposal's own replacements come first, matching the order Cluster.Evict
 	// actually places pods in. A checker that preferred existing slack would
 	// answer a different question than the executor asks.
-	var scratch []corev1.ResourceList
+	var scratch []Slot
 	// Replacements the executor has already launched are standing nodes, picked up
 	// by the loop below. Counting them here as well would approve a move against
 	// capacity the cluster does not have. Launch actions fire in DAG order, so the
@@ -534,15 +576,26 @@ func (k PodsStillFitChecker) Check(_ context.Context, p Proposal) error {
 		if it == nil || i < k.Cluster.LaunchesInFlight {
 			continue
 		}
-		scratch = append(scratch, k.Cluster.Catalog.Effective(it))
+		eff := k.Cluster.Catalog.Effective(it)
+		// A replacement is empty, so free is its whole effective capacity. Free is
+		// a copy, because the scratch list is mutated as pods are placed and the
+		// allocatable denominator must not move with it.
+		scratch = append(scratch, Slot{Free: eff.DeepCopy(), Allocatable: eff})
 	}
 	for _, id := range k.Cluster.sortedIDs() {
 		n := k.Cluster.Nodes[id]
 		if n.Deleted || n.Tainted || draining[id] {
 			continue
 		}
-		scratch = append(scratch, k.Cluster.free(n))
+		scratch = append(scratch, k.Cluster.slotFor(n))
 	}
+
+	// The same strategy the executor will use. These two used to be one policy by
+	// accident, both being first fit over sorted IDs. Now that placement is a
+	// choice, a checker asking a different question than the executor answers
+	// would approve moves that then strand pods, and refuse moves that would have
+	// worked.
+	strategy := k.Cluster.strategy()
 
 	for _, cand := range p.Candidates {
 		n, ok := k.Cluster.Nodes[cand.ProviderID]
@@ -551,22 +604,11 @@ func (k PodsStillFitChecker) Check(_ context.Context, p Proposal) error {
 		}
 		for _, pod := range n.Pods {
 			need := podNeeds(pod)
-			placed := false
-			for _, free := range scratch {
-				if !fitsInto(free, need) {
-					continue
-				}
-				for name, want := range need {
-					have := free[name]
-					have.Sub(want)
-					free[name] = have
-				}
-				placed = true
-				break
-			}
-			if !placed {
+			i, ok := Pick(strategy, scratch, need)
+			if !ok {
 				return fmt.Errorf("pod %s has nowhere to go", pod.Name)
 			}
+			scratch[i].claim(need)
 		}
 	}
 	return nil
@@ -844,6 +886,15 @@ type RunConfig struct {
 	// Upstream returns after the first valid command; zero here means no cap. See
 	// SingleNodeEvaluation.MaxProposals.
 	SingleNodeMaxProposals int
+
+	// Placement is the scheduler scoring strategy evicted pods are placed under,
+	// and the one PodsStillFit checks feasibility against.
+	//
+	// It is a stage-3 input, because placement takes the cluster and stages 1 and 2
+	// do not have it. What it changes is where waste ends up, which decides how much
+	// of it a later pass can reclaim. The empty value is first-fit, which is what
+	// this simulator did before the choice existed. See placement.go.
+	Placement PlacementStrategyName
 }
 
 func DefaultRunConfig(k float64, budget int) RunConfig {
@@ -860,6 +911,18 @@ func DefaultRunConfig(k float64, budget int) RunConfig {
 		// Half a workload must stay up. High enough that a PDB refuses something
 		// and low enough that it does not refuse everything.
 		PDBMinAvailableFraction: 0.5,
+		// First fit, named rather than inherited.
+		//
+		// It is the default on fidelity grounds and not for continuity. Placement
+		// here is the consolidation reschedule, and Karpenter does that itself in
+		// addToExistingNode: the lowest-indexed existing node the pod can be added
+		// to, over a list sorted initialized-first then by node name. It does not
+		// run the kube scheduler's scoring plugins over those nodes. So first fit
+		// over sorted IDs is what the controller under study does, and the two
+		// allocation strategies are what the scheduler did to the pods before
+		// consolidation ever saw them, which is the upstream condition the entropy
+		// measurement varies.
+		Placement: PlacementFirstFit,
 	}
 }
 
@@ -966,6 +1029,9 @@ func Run(ctx context.Context, nodes []NodeSnapshot, totals PoolTotals, cat *Cata
 	// than re-summing the pool per proposal.
 	cluster.Totals = totals
 	cluster.Threshold = cfg.Threshold
+	// One strategy for the pass, read by both the executor and PodsStillFit, so
+	// feasibility is decided against the placement that will actually happen.
+	cluster.Placement = cfg.Placement.MustStrategy()
 	markNominated(cluster, nodes, cfg.NominateEvery)
 	// Indexing walks every pod, which is the PDB controller's cost. It runs here
 	// rather than inside a checker so the checker's read count is the eviction

@@ -24,6 +24,8 @@ func main() {
 	sourceCeiling := flag.Float64("source-ceiling", 0.50, "top of the Underutilized band")
 	destFloor := flag.Float64("destination-floor", 0.60, "bottom of the Destination band")
 	fullCeiling := flag.Float64("full-ceiling", 0.95, "utilization at which no further pod fits")
+	placement := flag.String("placement", string(sim.PlacementFirstFit),
+		"where evicted pods land: first-fit, least-allocated (spread), or most-allocated (pack)")
 	csv := flag.Bool("csv", false, "emit one CSV row instead of a report")
 	header := flag.Bool("csv-header", false, "print the CSV header and exit")
 	flag.Parse()
@@ -36,6 +38,13 @@ func main() {
 	cfg := sim.DefaultRunConfig(*k, *budget)
 	if *threshold >= 0 {
 		cfg.Threshold = *threshold
+	}
+	cfg.Placement = sim.PlacementStrategyName(*placement)
+	// Reject an unknown name here rather than letting the pipeline panic on it. A
+	// typo in a sweep script is a usage error and should read like one.
+	if _, err := cfg.Placement.Strategy(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
 	}
 	cfg.Bands = sim.BandConfig{
 		SourceCeiling:    *sourceCeiling,
@@ -64,9 +73,10 @@ func report(seed int64, k float64, cfg sim.RunConfig, r sim.Result) string {
 	var b strings.Builder
 	f := func(format string, args ...any) { fmt.Fprintf(&b, format, args...) }
 
-	f("seed=%d k=%.2f threshold=%.3f budget=%d bands=%.2f/%.2f/%.2f\n",
+	f("seed=%d k=%.2f threshold=%.3f budget=%d bands=%.2f/%.2f/%.2f placement=%s\n",
 		seed, k, cfg.Threshold, cfg.Budget,
-		cfg.Bands.SourceCeiling, cfg.Bands.DestinationFloor, cfg.Bands.FullCeiling)
+		cfg.Bands.SourceCeiling, cfg.Bands.DestinationFloor, cfg.Bands.FullCeiling,
+		cfg.Placement)
 	f("\n")
 	f("stage 1  identify     %5d nodes -> %d candidates (%.1f%%)   %s\n",
 		r.NodesIn, r.CandidatesOut, pct(r.CandidatesOut, r.NodesIn), dur(r.IdentifyNanos))
@@ -111,7 +121,9 @@ func report(seed int64, k float64, cfg sim.RunConfig, r sim.Result) string {
 // The per-path columns are what let a sweep say which of the three produced a
 // savings figure. multi_batch and multi_probes are the binary search's own
 // numbers, which no aggregate can recover.
-const csvHeader = "nodes,seed,k,threshold,budget,candidates,destinations,proposals," +
+// placement is a column because two rows with the same seed and different
+// placement are different runs, and a sweep that omits it cannot tell them apart.
+const csvHeader = "nodes,seed,k,threshold,budget,placement,candidates,destinations,proposals," +
 	"committed,conflicts,applied,proceeded,stopped,stopped_actions,stopped_score," +
 	"savings_proposed,savings_realized,cost_before,cost_after," +
 	"pending,budget_left,identify_ns,generate_ns,compact_ns,execute_ns," +
@@ -121,9 +133,9 @@ const csvHeader = "nodes,seed,k,threshold,budget,candidates,destinations,proposa
 
 func csvRow(nodes int, seed int64, k float64, cfg sim.RunConfig, r sim.Result) string {
 	e, m, s := r.Paths[sim.PathEmpty], r.Paths[sim.PathMultiNode], r.Paths[sim.PathSingleNode]
-	return fmt.Sprintf("%d,%d,%g,%g,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.6f,%.6f,%.6f,%.6f,%d,%d,%d,%d,%d,%d"+
+	return fmt.Sprintf("%d,%d,%g,%g,%d,%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.6f,%.6f,%.6f,%.6f,%d,%d,%d,%d,%d,%d"+
 		",%d,%d,%.6f,%d,%d,%.6f,%d,%d,%d,%d,%.6f",
-		nodes, seed, k, cfg.Threshold, cfg.Budget,
+		nodes, seed, k, cfg.Threshold, cfg.Budget, cfg.Placement,
 		r.CandidatesOut, r.Destinations, r.ProposalsGenerated,
 		r.Committed, r.Conflicts, r.Applied, r.Proceeded,
 		r.Stopped, r.StoppedActions, r.StopCauses[sim.ScoreStillClears],
