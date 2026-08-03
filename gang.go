@@ -183,16 +183,21 @@ func MoveDisruptionCost(nodes int, evicted []*corev1.Pod) float64 {
 // With no gang pods on the node it equals RescheduleDisruptionCost term for term,
 // so every non-gang number in this simulator is unchanged.
 //
-// With a gang spanning nodes it over-prices, and that is the architectural cost
-// of keeping stage 1 local. A node holding one member of a five-member gang is
-// charged the whole outage, because from that node's own pods there is no way to
-// tell the difference between holding the only member and holding one of five.
-// Two nodes each holding members of the same gang are therefore each charged the
-// full outage, while a move taking both is charged once. The over-pricing is
-// safe in the direction that matters, since it makes a node look more expensive
-// to disrupt than it is, but it is not free: it pushes such nodes below stage 1's
-// delete-ratio floor, and the batch that would have priced them correctly is
-// exactly what stage 1 has already pruned. See the note on PoolTotals in Totals.
+// With a gang spanning nodes, pricing a single node over-charges: a node holding
+// one member of a five-member gang is charged the whole outage, because from that
+// node's own pods there is no way to tell the difference between holding the only
+// member and holding one of five. Two nodes each holding members of the same gang
+// are each charged the full outage, while a move taking both is charged once.
+//
+// This is not an architectural cost of locality. It is pricing at the wrong unit.
+// The decision unit for a gang is the gang, not a node that happens to hold a
+// member (#6). Scored as one candidate over its own nodes, the gang is charged
+// once and the over-pricing does not arise, and doing so stays local because the
+// read set is the gang's nodes, which is exactly what the move acts on. Reading a
+// gang's nodes to decide about the gang is as local as reading one node to decide
+// about a single pod. Until the candidate unit is the gang, this single-node form
+// over-prices, which is safe in direction (a node looks dearer to disrupt than it
+// is) but pushes spanning-gang nodes below the stage-1 floor.
 func NodeDisruptionCost(pods []*corev1.Pod) float64 {
 	return MoveDisruptionCost(1, pods)
 }
@@ -217,12 +222,13 @@ func GangsBroken(evicted []*corev1.Pod) []string {
 // NodeDisruptionCost over nodes charges a gang once per node holding a member,
 // so Totals subtracts this difference.
 //
-// This read is not local and cannot be made local. Deciding how many nodes a gang
-// spans requires looking at every node in the pool. That is not a new
-// non-locality, since PoolTotals is already a sum over the pool computed once per
-// reconcile and handed down, but it is a real one: the per-node costs stages 1 and
-// 2 read do not sum to the denominator they divide by, and no local read can fix
-// the discrepancy.
+// Computing this correction reads the whole pool, but PoolTotals is a pool sum
+// already, computed once per reconcile and handed down, so it adds no reach the
+// denominator did not have. The discrepancy it corrects, that per-node costs do
+// not sum to the pool denominator, is the same single-node-unit artifact as in
+// NodeDisruptionCost: it disappears once a gang is one candidate scored once (#6),
+// because then the per-candidate costs and the pool total count each gang the
+// same way.
 func poolGangOverCount(nodes []NodeSnapshot) float64 {
 	perNode := 0.0
 	var all []*corev1.Pod
