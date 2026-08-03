@@ -853,11 +853,19 @@ func TestRunEndToEnd(t *testing.T) {
 	if res.CandidatesOut > res.NodesIn {
 		t.Errorf("stage 1 emitted %d candidates from %d nodes", res.CandidatesOut, res.NodesIn)
 	}
-	// Two outcomes and nothing else. A proposal either ran out of actions or out
-	// of preconditions.
-	if res.Applied != res.Proceeded+res.Stopped {
-		t.Errorf("applied %d != proceed %d + stopped %d",
-			res.Applied, res.Proceeded, res.Stopped)
+	// Every applied proposal has exactly one outcome: it ran out of actions, out
+	// of preconditions, or out of capacity for an all-or-nothing launch set.
+	if res.Applied != res.Proceeded+res.Stopped+res.Abandoned {
+		t.Errorf("applied %d != proceed %d + stopped %d + abandoned %d",
+			res.Applied, res.Proceeded, res.Stopped, res.Abandoned)
+	}
+	// No generator emits an atomic proposal and the default provider refuses
+	// nothing, so a pass cannot abandon anything. This pins that: an abandonment
+	// appearing here means a generator started setting AtomicLaunch and the
+	// numbers below need re-reading.
+	if res.Abandoned != 0 || res.LaunchesReleased != 0 {
+		t.Errorf("pass abandoned %d proposals and released %d launches, want none",
+			res.Abandoned, res.LaunchesReleased)
 	}
 	// Every stop is attributed, or the cause histogram is not reporting the pass
 	// it claims to.

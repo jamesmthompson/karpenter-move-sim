@@ -213,6 +213,23 @@ type Proposal struct {
 	// Actions in dependency order. Index i may depend only on indices < i.
 	Actions []Action
 
+	// AtomicLaunch makes this proposal's launch set all-or-nothing: either every
+	// Launch lands or none do and the ones that landed are released. False is
+	// Omega's incremental transaction, which "accepts all but the conflicting
+	// changes," and it is the default because every existing proposal wants it.
+	//
+	// It is a property of the launch set and not of the whole move. The eviction
+	// half has no undo, so nothing here promises anything about it. What the flag
+	// buys is that the eviction half never begins from a partial acquisition.
+	//
+	// The flag only says something for a proposal with two or more launches. A
+	// single-launch REPLACE is trivially all-or-nothing already, since one launch
+	// either happens or does not, and setting the flag on one changes nothing.
+	//
+	// See atomic.go for the action shape this requires and the executor's Apply
+	// for what it does.
+	AtomicLaunch bool
+
 	// Preconditions are the hard constraints whose violation makes this move
 	// illegal rather than merely worse. See precondition.go.
 	Preconditions []PreconditionKind
@@ -295,9 +312,7 @@ type Compactor interface {
 // Stage 4: execution
 // -----------------------------------------------------------------------------
 
-// Outcome is what became of one proposal. There are two answers because there
-// are two things that can happen: the actions all fired, or a precondition
-// stopped them.
+// Outcome is what became of one proposal.
 type Outcome int
 
 const (
@@ -305,11 +320,23 @@ const (
 	Proceed Outcome = iota
 	// Stopped: a precondition failed. Whatever had already fired stays.
 	Stopped
+	// Abandoned: an AtomicLaunch proposal could not complete its launch set, so
+	// the launches that did land were released and the proposal holds none of the
+	// capacity it asked for. It is a separate outcome from Stopped because a
+	// Stopped proposal keeps whatever it acquired and an Abandoned one does not.
+	//
+	// It says nothing about the proposal's non-launch actions. A taint that fired
+	// before the launch set stays tainted, which is the same state a Stopped
+	// proposal leaves and one the cluster already handles.
+	Abandoned
 )
 
 func (o Outcome) String() string {
-	if o == Stopped {
+	switch o {
+	case Stopped:
 		return "Stopped"
+	case Abandoned:
+		return "Abandoned"
 	}
 	return "Proceed"
 }
@@ -321,6 +348,12 @@ func (o Outcome) String() string {
 // action leaves behind is one the system already handles continuously. Ordering
 // is what survives: a later pass cannot recover the gap where pods are pending
 // because a node was deleted before its replacement was ready.
+//
+// AtomicLaunch does not change that. Releasing a node nobody put a pod on is not
+// an unwind of a committed change, because a launch that no eviction has depended
+// on yet has had no effect anyone can observe: the state where four of five nodes
+// are up is never committed rather than committed and reversed. No eviction is
+// ever compensated for, which is the thing that cannot be done.
 type Executor interface {
 	// Apply walks the action DAG, checking preconditions before each action. It
 	// returns whether the proposal ran out of actions or out of preconditions.

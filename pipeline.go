@@ -205,6 +205,17 @@ type Cluster struct {
 	// that its score never charged it for.
 	Pending []*corev1.Pod
 
+	// LaunchFails decides which launches the cloud provider refuses. Nil is a
+	// provider with capacity for everything, which is what every existing run
+	// assumes.
+	//
+	// It is a predicate on the cluster rather than a property of the catalog,
+	// because launch failure is not a property of an instance type. The same type
+	// launches now and fails in a minute when the zone runs out, and the thing the
+	// atomic path has to be tested against is exactly that: a set of N launches
+	// where some succeed and some do not. See FailLaunchesOf and FailLaunchAfter.
+	LaunchFails func(*cloudprovider.InstanceType) bool
+
 	// Totals and Threshold are what ScoreStillClears compares against. They enter
 	// with the cluster because stage 3 is the first stage holding both: the pass's
 	// denominators and the approval floor stage 2 used.
@@ -313,6 +324,9 @@ func (c *Cluster) Launch(it *cloudprovider.InstanceType) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("launch %s: no available offering", it.Name)
 	}
+	if c.LaunchFails != nil && c.LaunchFails(it) {
+		return "", &LaunchFailure{InstanceType: it.Name}
+	}
 	c.launchSeq++
 	id := fmt.Sprintf("i-new-%04d", c.launchSeq)
 	c.Nodes[id] = &ClusterNode{
@@ -323,6 +337,36 @@ func (c *Cluster) Launch(it *cloudprovider.InstanceType) (string, error) {
 		Launched:     true,
 	}
 	return id, nil
+}
+
+// Release gives back a node this pass launched and nothing has used yet.
+//
+// It removes the entry instead of marking it Deleted, because a released node is
+// not a node the cluster once had. Nothing was scheduled onto it, so leaving a
+// tombstone behind would report a deletion that no workload experienced and would
+// make an abandoned acquisition look like a disruption.
+//
+// It refuses a node holding pods, which is the boundary between this and the
+// eviction rollback this simulator does not have. A node with a pod on it has been
+// used, and giving it back means moving that pod, which is a disruption and not a
+// release. Reaching that state is a mechanism fault: the executor only releases
+// launches whose dependent evictions have not fired.
+//
+// launchSeq is not rewound. A later launch reusing a released ID would make two
+// different nodes indistinguishable in a trace.
+func (c *Cluster) Release(providerID string) error {
+	n, ok := c.Nodes[providerID]
+	if !ok {
+		return fmt.Errorf("release %s: node is gone", providerID)
+	}
+	if !n.Launched {
+		return fmt.Errorf("release %s: node was not launched by this pass", providerID)
+	}
+	if len(n.Pods) > 0 {
+		return fmt.Errorf("release %s: node holds %d pods, releasing it would be a disruption", providerID, len(n.Pods))
+	}
+	delete(c.Nodes, providerID)
+	return nil
 }
 
 // Evict removes one pod from a node and places it wherever it fits. A pod with
@@ -759,6 +803,17 @@ type MemoryExecutor struct {
 	// ran. It accumulates across proposals, so it is the pass's total cost for that
 	// constraint and not one proposal's.
 	NodeReads map[PreconditionKind]int
+
+	// Abandoned is AtomicLaunch proposals whose launch set could not be completed.
+	// It is separate from Stopped because it is a different event: no precondition
+	// failed and nothing was left behind, the provider just did not have the
+	// capacity the set asked for.
+	Abandoned int
+
+	// LaunchesReleased is nodes given back by abandoned proposals, summed over the
+	// pass. It is the size of the partial acquisition all-or-nothing prevented, and
+	// it is the number that says whether the mechanism ever fires.
+	LaunchesReleased int
 }
 
 func NewMemoryExecutor(c *Cluster) *MemoryExecutor {
@@ -776,12 +831,37 @@ func NewMemoryExecutor(c *Cluster) *MemoryExecutor {
 // faults in the mechanism itself: an action released before its prerequisites
 // confirmed, a missing checker, a write against a node that vanished. Conflating
 // the two would make a legal stop indistinguishable from a bug.
+//
+// A launch the provider refuses is the third case, and what happens next is the
+// one thing AtomicLaunch changes.
+//
+// Incremental, which is the default and what every proposal did before the flag
+// existed: the refusal comes back as an error and whatever launched stays. A
+// partial launch set is capacity the pass bought and the next pass reclaims.
+//
+// All-or-nothing: release every node this proposal launched and return Abandoned.
+// The proposal delivers nothing and evicts nothing. That the release is safe rests
+// on the DAG, not on timing: validateAtomicLaunch has already established that
+// every Evict and every Delete waits on every Launch, so a refusal reaches this
+// point with the launched nodes empty and nothing depending on them. This is the
+// four-node state never being committed. It is not the eviction rollback this
+// simulator does not have, which would have had to move pods that were already
+// somewhere.
 func (e *MemoryExecutor) Apply(ctx context.Context, p Proposal) (Outcome, error) {
+	if p.AtomicLaunch {
+		if err := validateAtomicLaunch(p); err != nil {
+			return Proceed, err
+		}
+	}
+
 	confirmed := map[int]bool{}
 	fired := 0
 	// replacement is the node this proposal launched, so its own evictions land
 	// on the capacity it bought.
 	replacement := ""
+	// launched is every node this proposal created, in launch order. It is the
+	// release list for an atomic proposal and nothing reads it otherwise.
+	var launched []string
 
 	// PodsStillFit counts a replacement that has not launched yet as capacity,
 	// since the proposal is about to buy it. Once the Launch fires the node is
@@ -804,6 +884,12 @@ func (e *MemoryExecutor) Apply(ctx context.Context, p Proposal) (Outcome, error)
 			// Stop here. Nothing is undone, because each action already applied
 			// left a state the cluster handles on its own terms, and unwinding
 			// would be a second mechanism doing what the first does next pass.
+			//
+			// This is a stop and not an abandonment even on an atomic proposal. A
+			// precondition that flipped is the cluster saying the rest of the move
+			// is illegal, which is a statement about the move and not about whether
+			// the launch set could be completed. The launches that fired stay, for
+			// the same reason they stay on any other stop.
 			e.Failures = append(e.Failures, err)
 			var v *PreconditionViolation
 			if errors.As(err, &v) {
@@ -822,8 +908,13 @@ func (e *MemoryExecutor) Apply(ctx context.Context, p Proposal) (Outcome, error)
 		case Launch:
 			id, err := e.Cluster.Launch(a.InstanceType)
 			if err != nil {
+				var refused *LaunchFailure
+				if p.AtomicLaunch && errors.As(err, &refused) {
+					return e.abandon(p, launched)
+				}
 				return Proceed, err
 			}
+			launched = append(launched, id)
 			replacement = id
 			e.Cluster.LaunchesInFlight++
 		case Evict:
@@ -842,6 +933,31 @@ func (e *MemoryExecutor) Apply(ctx context.Context, p Proposal) (Outcome, error)
 
 	e.Proceeded++
 	return Proceed, nil
+}
+
+// abandon gives back the launches an atomic proposal could not complete and
+// reports the outcome.
+//
+// Nothing is refunded to the disruption budget, because nothing was charged. The
+// budget is spent on Delete, and validateAtomicLaunch has established that every
+// Delete in an atomic proposal waits on every Launch, so a proposal that failed a
+// launch has deleted nothing. A refund path here would be dead code that looked
+// like it was doing something.
+//
+// A release that fails is a mechanism fault. Release refuses a node holding pods
+// or a node the pass did not launch, and neither can be true of a node reached
+// this way, so hitting one means the DAG validation or the launch bookkeeping is
+// wrong and averaging it into an outcome would hide that.
+func (e *MemoryExecutor) abandon(p Proposal, launched []string) (Outcome, error) {
+	for _, id := range launched {
+		if err := e.Cluster.Release(id); err != nil {
+			return Proceed, fmt.Errorf("abandoning %s: %w", p.ID, err)
+		}
+		e.LaunchesReleased++
+	}
+	e.Cluster.LaunchesInFlight = 0
+	e.Abandoned++
+	return Abandoned, nil
 }
 
 // -----------------------------------------------------------------------------
@@ -954,6 +1070,13 @@ type Result struct {
 
 	// StoppedActions is how many actions fired inside the stopped proposals.
 	StoppedActions int
+
+	// Abandoned is AtomicLaunch proposals that could not complete their launch
+	// set, and LaunchesReleased is the nodes they gave back. Both are zero in a
+	// pass with no atomic proposals and no launch failures, which is every pass
+	// the consolidation paths produce today.
+	Abandoned        int
+	LaunchesReleased int
 
 	// StopCauses is which precondition did the stopping, counted per kind. A pass
 	// that stops ten moves on capacity is a different pass from one that stops ten
@@ -1073,6 +1196,8 @@ func Run(ctx context.Context, nodes []NodeSnapshot, totals PoolTotals, cat *Cata
 	res.Proceeded = exec.Proceeded
 	res.Stopped = exec.Stopped
 	res.StoppedActions = exec.ActionsApplied
+	res.Abandoned = exec.Abandoned
+	res.LaunchesReleased = exec.LaunchesReleased
 	res.StopCauses = exec.StopCauses
 	res.PoolCostAfter = cluster.Cost()
 	res.SavingsRealized = res.PoolCostBefore - res.PoolCostAfter

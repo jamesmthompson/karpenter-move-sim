@@ -99,6 +99,13 @@ func report(seed int64, k float64, cfg sim.RunConfig, r sim.Result) string {
 		r.Committed, r.Conflicts, dur(r.CompactNanos))
 	f("stage 4  execute      %5d applied: %d proceed, %d stopped early  %s\n",
 		r.Applied, r.Proceeded, r.Stopped, dur(r.ExecuteNanos))
+	// Printed only when it happened. No generator sets AtomicLaunch, so a pass
+	// abandons nothing, and a column of zeros in every report would be noise. The
+	// line appearing at all means an all-or-nothing launch set could not be
+	// completed.
+	if r.Abandoned > 0 {
+		f("         %5d abandoned: %d launches released\n", r.Abandoned, r.LaunchesReleased)
+	}
 	// Which precondition stopped them, because a pass stopping on capacity and a
 	// pass stopping on do-not-disrupt otherwise print the same.
 	for _, kind := range r.StopCausesSorted() {

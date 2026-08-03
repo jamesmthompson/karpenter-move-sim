@@ -620,6 +620,13 @@ func batchID(prefix string, batch []NodeSnapshot, replacement string) string {
 // replacement confirms Ready. A delete waits on its own node's evictions and not
 // on the other candidates', because a node with an empty pod list is safe to
 // remove whatever is still running elsewhere.
+//
+// The proposals built from this do not set AtomicLaunch, and they do not need to.
+// There is one replacement or none, and one launch either happens or does not, so
+// a single-launch batch is all-or-nothing whatever the flag says. That gating is
+// nonetheless what an atomic proposal requires, so this shape satisfies
+// validateAtomicLaunch as it stands and would keep doing so if a batch ever
+// launched several nodes.
 func batchActions(batch []NodeSnapshot, replacement *cloudprovider.InstanceType) []Action {
 	var actions []Action
 	taintAt := make([]int, len(batch))
