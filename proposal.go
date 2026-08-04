@@ -77,7 +77,9 @@ type NodeSnapshot struct {
 	// member here. NodeDisruptionCost computes it.
 	//
 	// It is a bound rather than an exact figure when a gang spans nodes, because a
-	// node cannot see members it does not hold. See NodeDisruptionCost.
+	// node cannot see members it does not hold. Nothing scores a gang from this
+	// figure: a gang candidate prices its own nodes together, which is what makes
+	// the charge exact. See Candidate in candidate.go and NodeDisruptionCost.
 	DisruptionCost float64
 }
 
@@ -97,6 +99,9 @@ type PoolTotals struct {
 // One caveat travels with it: a node that fails alone could still join a passing
 // multi-node batch. The nodes compensating for it would already be strong
 // single-node candidates.
+//
+// This is the node form. Candidate.DeleteRatio is the same arithmetic at the
+// decision unit, and the two agree term for term on a node holding no gang member.
 func DeleteRatio(n NodeSnapshot, totals PoolTotals) float64 {
 	if totals.Cost == 0 || totals.DisruptionCost == 0 || n.DisruptionCost == 0 {
 		return 0
@@ -106,15 +111,32 @@ func DeleteRatio(n NodeSnapshot, totals PoolTotals) float64 {
 	return savingsFraction / disruptionFraction
 }
 
-// Identify is stage 1. One bit per node.
+// Identify is stage 1, projected back onto the node list: one bit per node,
+// saying whether that node belongs to a decision unit worth generating a move
+// for.
 //
-// Note what it does not take: no context, no client, no cluster. The filter is
-// a pure function, so it can be evaluated for every node in parallel, cached
-// against a snapshot, and tested with no API server.
+// The unit is the workload scope, not the node. A node carrying no gang member is
+// its own candidate and its bit is the node's own test. A node carrying gang
+// members belongs to one candidate per gang on it, each scored once over that
+// gang's nodes, and the node's bit is true when any of them passed. See
+// candidate.go for the unit and CandidateBits for stage 1 at that unit, which is
+// the form with one bit per candidate rather than one per node.
 //
-// Two tests, in this order. A node holding a do-not-disrupt pod is not a
-// candidate at all, and a node whose delete ratio cannot reach the approval
-// threshold cannot produce a passing move.
+// The projection exists because the number this function reports is a share of
+// the node list, and because every existing caller asks about nodes. It is not
+// where the decision is made. What changed is the arithmetic behind the bit: a
+// gang is charged one outage over its own nodes instead of a full outage on each
+// node holding a member, so five nodes holding one gang are no longer each priced
+// as though the gang were theirs alone.
+//
+// Note what it still does not take: no context, no client, no cluster. Grouping
+// the nodes by gang label reads the argument it was given, so the unit change cost
+// it nothing in reach. The filter stays a pure function, evaluable in parallel,
+// cacheable against a snapshot, and testable with no API server.
+//
+// Two tests, in this order. A candidate any of whose nodes holds a do-not-disrupt
+// pod is not a candidate at all, and a candidate whose delete ratio cannot reach
+// the approval threshold cannot produce a passing move.
 //
 // Order matters for the denominators. Upstream rejects undisruptable nodes in
 // NewCandidate, before pool totals are computed, so they never appear in either
@@ -124,9 +146,24 @@ func DeleteRatio(n NodeSnapshot, totals PoolTotals) float64 {
 // The measurement this exists to support: how much of the oracle's achievable
 // savings survives the filter, and how small k/N gets.
 func Identify(nodes []NodeSnapshot, totals PoolTotals, k float64) []bool {
+	cands := Candidates(nodes)
+	passed := CandidateBits(cands, totals, k)
+
+	// A node's bit is true when some candidate covering it passed. Two gangs sharing
+	// a node give it two candidates, and the node is worth a move if either is.
+	keep := make(map[string]bool, len(nodes))
+	for i, c := range cands {
+		if !passed[i] {
+			continue
+		}
+		for _, n := range c.Nodes {
+			keep[n.ProviderID] = true
+		}
+	}
+
 	bits := make([]bool, len(nodes))
 	for i, n := range nodes {
-		bits[i] = Disruptable(n) && DeleteRatio(n, totals) >= 1/k
+		bits[i] = keep[n.ProviderID]
 	}
 	return bits
 }
@@ -138,7 +175,9 @@ func Identify(nodes []NodeSnapshot, totals PoolTotals, k float64) []bool {
 // ValidatePodsDisruptable and returns no candidate for the graceful class, which
 // keeps the node out of the pool totals as well.
 //
-// This reads one node's own pods, so stage 1 stays local.
+// This reads one node's own pods. A gang candidate applies it to every node its
+// move acts on, which is Candidate.Disruptable, and stays local for the same
+// reason: the read set is the action set.
 func Disruptable(n NodeSnapshot) bool {
 	for _, p := range n.ReschedulablePods {
 		if p.Annotations[v1.DoNotDisruptAnnotationKey] == "true" {
@@ -195,6 +234,20 @@ type Proposal struct {
 
 	// Nodes this proposal removes.
 	Candidates []NodeSnapshot
+
+	// GangID names the gang this proposal is a move over, empty on a node-unit
+	// move. It says the proposal's Candidates are one decision unit rather than a
+	// batch of independent ones, which is what makes the proposal indivisible: a
+	// gang cannot be half-consolidated, so committing some of these nodes and not
+	// the rest takes the workload down and recovers part of the price.
+	//
+	// The compactor needs no special case for it, and that is worth stating rather
+	// than discovering. Its accounting is already per proposal: overlap is checked
+	// across every candidate node, and the budget must cover the whole candidate
+	// count or the proposal is skipped entirely. So a gang move commits whole or not
+	// at all under the rule that was already there. The field is what lets a caller
+	// tell the two units apart, and what a test asserts on.
+	GangID string
 
 	// Instance types this proposal launches. Empty for a pure DELETE.
 	Replacements []*cloudprovider.InstanceType

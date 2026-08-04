@@ -35,7 +35,7 @@ import (
 // rather than a sum of free capacity, because a batch's pods against a batch's
 // worth of holes passes the sum test almost always. See batchFits.
 
-// Path names one of the three evaluations.
+// Path names one of the evaluations.
 type Path int
 
 const (
@@ -46,6 +46,13 @@ const (
 	PathMultiNode
 	// PathSingleNode is upstream's SingleNodeConsolidation, the fallback.
 	PathSingleNode
+	// PathGang decides about gangs rather than about nodes. It has no upstream
+	// counterpart, and it is not a fourth node path: it is the same consolidation
+	// question asked at the unit a gang's move acts on. It runs before the three
+	// node paths, and the nodes it owns are withheld from them, because a node
+	// holding a gang member is not a node decision. Added last so the constants
+	// above keep their values.
+	PathGang
 )
 
 func (p Path) String() string {
@@ -56,6 +63,8 @@ func (p Path) String() string {
 		return "multi"
 	case PathSingleNode:
 		return "single"
+	case PathGang:
+		return "gang"
 	}
 	return "unknown"
 }
@@ -769,12 +778,15 @@ func (s SingleNodeEvaluation) Evaluate(candidates, dests []NodeSnapshot, cat *Ca
 
 // PathStats is what one path contributed to a pass.
 type PathStats struct {
-	// Candidates is how many nodes the path's ShouldDisrupt accepted, after the
-	// nodes an earlier path claimed were removed.
+	// Candidates is how many decision units the path's ShouldDisrupt accepted,
+	// after what an earlier path claimed was removed. Nodes on the three node
+	// paths, gangs on the gang path.
 	Candidates int
 	Proposals  int
 	// Nodes is candidate nodes across the path's proposals. It differs from
-	// Proposals on the two batching paths.
+	// Proposals on the batching paths, and on the gang path it can exceed the
+	// distinct nodes involved, because two gangs sharing a node produce two
+	// proposals over it and the compactor is what resolves the overlap.
 	Nodes   int
 	Savings float64
 
@@ -784,10 +796,11 @@ type PathStats struct {
 	BatchSize int
 }
 
-// EvaluateInOrder runs the three paths in upstream's order and returns every
-// proposal they produced, with per-path attribution.
+// EvaluateInOrder runs the paths in order and returns every proposal they
+// produced, with per-path attribution.
 //
-// Two rules govern the interaction, and both are upstream's.
+// Two rules govern the interaction, and both are upstream's for the three node
+// paths.
 //
 // A node an earlier path claimed is withheld from later paths. Emptiness claims
 // the empty nodes, which is upstream's routing rather than a scheduling nicety:
@@ -799,12 +812,22 @@ type PathStats struct {
 //
 // Each path gets a fresh budget map, because upstream builds one per method.
 //
+// The gang path runs first and its rule is stronger than withholding what it
+// claimed. Every node holding a gang member is withheld from the three node
+// paths, whether the gang path proposed a move over it or not, because a
+// node-scoped move over such a node evicts part of a gang and leaves the rest
+// running. That costs the whole workload and recovers one node's price, and no
+// score the node paths compute would see it, since each of them prices what it
+// evicts from the node in front of it. Withholding is how "a move touching one
+// member touches all its nodes" is enforced rather than hoped for.
+//
 // Where this diverges from upstream, and it is the one place it does: upstream's
 // Reconcile returns after the first method that acts, and relies on requeueing
-// immediately for the rest. A pass here runs all three, so a single pass reports
-// what three consecutive reconciles would do. StopAfterFirstPath reproduces the
+// immediately for the rest. A pass here runs all of them, so a single pass reports
+// what consecutive reconciles would do. StopAfterFirstPath reproduces the
 // per-reconcile behavior exactly, and TestStopAfterFirstPath pins it.
 func EvaluateInOrder(nodes []NodeSnapshot, dests []NodeSnapshot, cat *Catalog, totals PoolTotals, cfg RunConfig) ([]Proposal, map[Path]PathStats) {
+	gang := GangEvaluation{Threshold: cfg.Threshold}
 	empty := EmptinessEvaluation{}
 	multi := MultiNodeEvaluation{Threshold: cfg.Threshold}
 	single := SingleNodeEvaluation{Threshold: cfg.Threshold, MaxProposals: cfg.SingleNodeMaxProposals}
@@ -813,13 +836,17 @@ func EvaluateInOrder(nodes []NodeSnapshot, dests []NodeSnapshot, cat *Catalog, t
 	claimed := map[string]bool{}
 	var all []Proposal
 
+	// Grouping the node list by gang label reads the list itself, so this costs no
+	// reach the node paths did not already have.
+	gangHeld := GangHeldNodes(nodes)
+
 	// Disruptable is upstream's ValidateNodeDisruptable, applied in NewCandidate
 	// before any method sees a candidate, so it is applied once here rather than
 	// repeated in each path's ShouldDisrupt.
 	candidatesFor := func(accept func(NodeSnapshot) bool) []NodeSnapshot {
 		var out []NodeSnapshot
 		for _, n := range nodes {
-			if claimed[n.ProviderID] || !Disruptable(n) || !accept(n) {
+			if claimed[n.ProviderID] || gangHeld[n.ProviderID] || !Disruptable(n) || !accept(n) {
 				continue
 			}
 			out = append(out, n)
@@ -839,6 +866,21 @@ func EvaluateInOrder(nodes []NodeSnapshot, dests []NodeSnapshot, cat *Catalog, t
 		}
 		stats[p] = s
 		all = append(all, props...)
+	}
+
+	// The gang path first, at the gang unit. Its candidates come from Candidates(),
+	// which groups the same node list the node paths walk.
+	var gangCands []Candidate
+	for _, c := range Candidates(nodes) {
+		if !c.IsGang() || !c.Disruptable() || !gang.ShouldDisrupt(c, totals, cfg.Threshold) {
+			continue
+		}
+		gangCands = append(gangCands, c)
+	}
+	gangProps := gang.Evaluate(gangCands, dests, cat, totals, poolBudgets(nodes, cfg.Budget))
+	record(PathGang, len(gangCands), gangProps, PathStats{})
+	if cfg.StopAfterFirstPath && len(gangProps) > 0 {
+		return all, stats
 	}
 
 	emptyCands := candidatesFor(func(n NodeSnapshot) bool { return empty.ShouldDisrupt(n, totals, cfg.Threshold) })

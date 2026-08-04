@@ -78,15 +78,18 @@ func report(seed int64, k float64, cfg sim.RunConfig, r sim.Result) string {
 		cfg.Bands.SourceCeiling, cfg.Bands.DestinationFloor, cfg.Bands.FullCeiling,
 		cfg.Placement)
 	f("\n")
-	f("stage 1  identify     %5d nodes -> %d candidates (%.1f%%)   %s\n",
-		r.NodesIn, r.CandidatesOut, pct(r.CandidatesOut, r.NodesIn), dur(r.IdentifyNanos))
+	// Units and not nodes. A gang is one candidate however many nodes hold its
+	// members, so the denominator is the units the fleet grouped into.
+	f("stage 1  identify     %5d nodes -> %d units -> %d candidates (%.1f%%, %d gangs)   %s\n",
+		r.NodesIn, r.CandidatesIn, r.CandidatesOut,
+		pct(r.CandidatesOut, r.CandidatesIn), r.GangCandidatesOut, dur(r.IdentifyNanos))
 	f("stage 2  generate     %5d destinations, %d proposals        %s\n",
 		r.Destinations, r.ProposalsGenerated, dur(r.GenerateNanos))
 	// Per path, in the order upstream runs them. A total cannot say which of the
 	// three produced it, and the interaction between them is what decides an
 	// outcome: emptiness claims the empty nodes, multi-node claims its batch
 	// before single-node walks.
-	for _, p := range []sim.Path{sim.PathEmpty, sim.PathMultiNode, sim.PathSingleNode} {
+	for _, p := range []sim.Path{sim.PathGang, sim.PathEmpty, sim.PathMultiNode, sim.PathSingleNode} {
 		s := r.Paths[p]
 		f("         %-12s %5d candidates, %d proposals over %d nodes, $%.4f/hr",
 			p, s.Candidates, s.Proposals, s.Nodes, s.Savings)

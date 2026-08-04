@@ -156,10 +156,15 @@ func TestOneGangSpanningNodesIsChargedOncePerMove(t *testing.T) {
 	}
 }
 
-// The finding this test exists to record: a gang spanning nodes cannot be priced
-// exactly from one node's own pods, and a node holding one of five members is
-// charged the whole outage. Stage 1 stays local at the price of over-pricing such
-// a node, which is safe in direction and not free in consequence.
+// The finding this test records is about NodeDisruptionCost and not about any
+// decision: a gang spanning nodes cannot be priced exactly from one node's own
+// pods, so the per-node figure charges a node holding one of five members the whole
+// outage.
+//
+// Nothing decides about a gang from that figure any more. The decision unit is the
+// gang, which prices its own nodes together and is charged once (#6). What the
+// per-node figure is still for is the bound NodeSnapshot.DisruptionCost carries and
+// the sum Totals corrects, and this test is about that arithmetic.
 func TestNodeLocalGangPricingOverchargesAndIsRecorded(t *testing.T) {
 	const outage = 8.0
 	// The same gang, once confined to one node and once split across two.
@@ -305,10 +310,23 @@ func TestTotalsRefusesGangPodsPricedBySum(t *testing.T) {
 	Totals(nodes)
 }
 
-// Raising gang prevalence must shrink the candidate set, because a gang member
-// makes its node dearer to disrupt and the delete ratio is what stage 1 filters
-// on. This is the run-level consequence of the step, and it is the number a claim
-// about gang pricing would be made of.
+// The meaning of this test changed with the decision unit (#6), so it is worth
+// saying what it used to claim and what it claims now.
+//
+// It used to assert that raising gang prevalence shrinks the candidate set, and
+// read 149 -> 102 -> 38 at prevalence 0, 0.1 and 0.3. That was presented as the
+// run-level consequence of the step. It was not. Two thirds of it was per-node
+// over-pricing: a node holding one member of a spanning gang was charged the whole
+// outage, so five such nodes paid five outages for a gang that costs one to break,
+// and the delete ratio pruned them. Scored at the workload scope the pricing
+// collapse is gone, and TestTheGangPrevalenceCollapseIsGone measures that with the
+// before-numbers alongside.
+//
+// What is left is real and this test now pins it: a gang's move needs every one of
+// its nodes, so one do-not-disrupt pod anywhere on them refuses the whole move, and
+// a gang spanning tens of nodes is nearly certain to hold one. That is the unit
+// reporting a constraint rather than mispricing one, and the sensitivity is to gang
+// span rather than to prevalence.
 func TestGangPrevalenceShrinksTheCandidateSet(t *testing.T) {
 	var counts []int
 	for _, frac := range []float64{0, 0.1, 0.3} {
@@ -326,11 +344,28 @@ func TestGangPrevalenceShrinksTheCandidateSet(t *testing.T) {
 			}
 		}
 		counts = append(counts, n)
-		fmt.Printf("gangFraction=%.1f poolDisruption=%.1f candidates=%d/%d\n",
-			frac, totals.DisruptionCost, n, len(nodes))
+
+		// The ratio floor alone, which is the term the old pricing broke, counted in
+		// distinct nodes so it is comparable with the column beside it. It no longer
+		// falls with prevalence, so whatever this test still measures is not price.
+		reached := map[string]bool{}
+		for _, c := range Candidates(nodes) {
+			if c.DeleteRatio(totals) < 0.5 {
+				continue
+			}
+			for _, id := range c.NodeIDs() {
+				reached[id] = true
+			}
+		}
+		fmt.Printf("gangFraction=%.1f poolDisruption=%.1f candidates=%d/%d (ratio floor alone reaches %d nodes)\n",
+			frac, totals.DisruptionCost, n, len(nodes), len(reached))
 	}
+	// At GangCount 6 over 200 nodes each gang spans tens of nodes, so every gang
+	// candidate holds a do-not-disrupt pod and is refused along with its nodes. More
+	// gang members therefore means fewer nodes in a drainable candidate.
 	if !(counts[0] > counts[1] && counts[1] > counts[2]) {
-		t.Errorf("candidates went %v as gang prevalence rose; more gangs must mean fewer candidates", counts)
+		t.Errorf("candidates went %v as gang prevalence rose; at these spans more gang "+
+			"members must mean fewer drainable candidates", counts)
 	}
 }
 

@@ -189,15 +189,21 @@ func MoveDisruptionCost(nodes int, evicted []*corev1.Pod) float64 {
 // member and holding one of five. Two nodes each holding members of the same gang
 // are each charged the full outage, while a move taking both is charged once.
 //
-// This is not an architectural cost of locality. It is pricing at the wrong unit.
-// The decision unit for a gang is the gang, not a node that happens to hold a
-// member (#6). Scored as one candidate over its own nodes, the gang is charged
-// once and the over-pricing does not arise, and doing so stays local because the
-// read set is the gang's nodes, which is exactly what the move acts on. Reading a
-// gang's nodes to decide about the gang is as local as reading one node to decide
-// about a single pod. Until the candidate unit is the gang, this single-node form
-// over-prices, which is safe in direction (a node looks dearer to disrupt than it
-// is) but pushes spanning-gang nodes below the stage-1 floor.
+// That over-pricing was never an architectural cost of locality, and the decision
+// unit no longer pays it. The unit for a gang is the gang (#6): Candidate in
+// candidate.go groups the gang's nodes and prices them once with
+// MoveDisruptionCost, so the gang is charged the one outage its move causes.
+// Grouping reads the node list itself, so the fix stays local, and the read set is
+// the gang's nodes, which is exactly what the move acts on. Reading a gang's nodes
+// to decide about the gang is as local as reading one node to decide about a single
+// pod.
+//
+// This single-node form stays for the two jobs it still has, neither of which is
+// deciding about a gang. It is what NodeSnapshot.DisruptionCost holds, so a node
+// carries a bound on what draining it alone would cost, and it is what Totals sums
+// before subtracting poolGangOverCount to reach the pool denominator. In both it is
+// a per-node quantity by construction, and where it over-states a spanning gang the
+// error is one-directional: a node reads dearer to disrupt than it is.
 func NodeDisruptionCost(pods []*corev1.Pod) float64 {
 	return MoveDisruptionCost(1, pods)
 }
@@ -222,13 +228,26 @@ func GangsBroken(evicted []*corev1.Pod) []string {
 // NodeDisruptionCost over nodes charges a gang once per node holding a member,
 // so Totals subtracts this difference.
 //
-// Computing this correction reads the whole pool, but PoolTotals is a pool sum
-// already, computed once per reconcile and handed down, so it adds no reach the
-// denominator did not have. The discrepancy it corrects, that per-node costs do
-// not sum to the pool denominator, is the same single-node-unit artifact as in
-// NodeDisruptionCost: it disappears once a gang is one candidate scored once (#6),
-// because then the per-candidate costs and the pool total count each gang the
-// same way.
+// It survived the move to the gang candidate unit (#6), and the reason is not the
+// one the earlier comment here predicted. The prediction was that per-candidate
+// costs would sum to the pool total once a gang was scored once, making the
+// correction redundant. They do not, and overlapping gangs are why. Three nodes,
+// two gangs of two members, one node holding a member of each: the true cost of
+// disrupting everything is three baselines plus two outages, 19. The per-node sum
+// is 35, over by two whole outages. The candidate sum is 36, worse, because the
+// shared node's baseline is counted in both gangs' candidates and each gang
+// candidate charges the outage of whatever else it evicts. A denominator built by
+// summing candidates would therefore need its own larger correction. Summing nodes
+// and subtracting this is what reaches 19.
+//
+// So the correction is not an artifact of the node unit. It is what makes the
+// denominator answer the question it is named for: not "what do the decision units
+// cost" but "what would disrupting this pool cost," which counts every node once
+// and every gang once whatever unit decides about them.
+//
+// Computing it reads the whole pool, but PoolTotals is a pool sum already,
+// computed once per reconcile and handed down, so it adds no reach the denominator
+// did not have.
 func poolGangOverCount(nodes []NodeSnapshot) float64 {
 	perNode := 0.0
 	var all []*corev1.Pod

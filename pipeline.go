@@ -101,6 +101,11 @@ func (c RankingCompactor) selectWithBudgets(proposals []Proposal, budgets map[Re
 			committed = append(committed, p)
 			continue
 		}
+		// The whole candidate set or none of it. That is what a gang move requires,
+		// since committing four of its five nodes takes the workload down and
+		// recovers four nodes' price for a five-node outage, and it is what this
+		// comparison already did for every batching path. Charging the budget per
+		// node and committing what fits would half-consolidate the gang.
 		if spent[p.Reason]+cost > budgets[p.Reason] {
 			continue
 		}
@@ -1050,11 +1055,22 @@ func DefaultRunConfig(k float64, budget int) RunConfig {
 }
 
 // Result is one pass through the pipeline. The first number the paper needs is
-// CandidatesOut over NodesIn.
+// CandidatesOut over CandidatesIn.
 type Result struct {
-	NodesIn       int
+	NodesIn int
+
+	// CandidatesIn is the decision units the node list grouped into, and
+	// CandidatesOut how many survived stage 1. They are units and not nodes: a gang
+	// is one candidate however many nodes hold its members, which is why
+	// CandidatesOut can exceed neither CandidatesIn nor, on a gangless fleet, NodesIn.
+	CandidatesIn  int
 	CandidatesOut int
-	Destinations  int
+
+	// GangCandidatesOut is the share of CandidatesOut that are gangs. Zero on a
+	// fleet with no gang labels, which is every fixture that does not ask for them.
+	GangCandidatesOut int
+
+	Destinations int
 
 	ProposalsGenerated int
 	Committed          int
@@ -1125,21 +1141,33 @@ type Result struct {
 func Run(ctx context.Context, nodes []NodeSnapshot, totals PoolTotals, cat *Catalog, cfg RunConfig) Result {
 	res := Result{NodesIn: len(nodes), PoolCostBefore: totals.Cost}
 
-	// Stage 1. One bit per node, no cluster.
+	// Stage 1. One bit per candidate, no cluster.
 	//
-	// Identify's bit is the single-node path's filter: Disruptable and the delete
-	// ratio. It is reported rather than used to gate stage 2, because two of the
-	// three paths do not apply it. Emptiness never scores at all, and multi-node
-	// has no CanPassThreshold, since a node that cannot pass alone can still ride
-	// in a batch that does. Feeding Identify's output to all three paths would
-	// deny multi-node candidates upstream gives it, and would drop empty nodes
-	// whose delete ratio is high but whose pool has a large denominator.
+	// The candidate is the decision unit: a node for ordinary pods, a gang for gang
+	// pods. Candidates() builds them by grouping the same []NodeSnapshot on the gang
+	// label, so stage 1 reads its own argument and gains no handle on anything else.
+	//
+	// The bit is the single-node path's filter at the candidate's scale: Disruptable
+	// over every node the move acts on, and the delete ratio computed once. It is
+	// reported rather than used to gate stage 2, because two of the three node paths
+	// do not apply it. Emptiness never scores at all, and multi-node has no
+	// CanPassThreshold, since a node that cannot pass alone can still ride in a batch
+	// that does. Feeding this output to all the paths would deny multi-node
+	// candidates upstream gives it, and would drop empty nodes whose delete ratio is
+	// high but whose pool has a large denominator. The gang path does apply it, in
+	// gangMove.
 	t0 := time.Now()
-	bits := Identify(nodes, totals, cfg.K)
+	cands := Candidates(nodes)
+	bits := CandidateBits(cands, totals, cfg.K)
 	res.IdentifyNanos = time.Since(t0).Nanoseconds()
-	for _, b := range bits {
-		if b {
-			res.CandidatesOut++
+	res.CandidatesIn = len(cands)
+	for i, b := range bits {
+		if !b {
+			continue
+		}
+		res.CandidatesOut++
+		if cands[i].IsGang() {
+			res.GangCandidatesOut++
 		}
 	}
 
