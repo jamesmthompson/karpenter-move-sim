@@ -7,14 +7,14 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
-// TestCompactorMissesDestinationContention demonstrates the README's known gap.
-// Two DELETE proposals are each planned against the same free capacity on one
-// destination. Neither removes the other's node, so RankingCompactor sees no
-// overlap and commits both. The first applies and takes the hole. The second
-// stops at apply time on PodsStillFit, which is the only place the conflict can
-// surface, because a Proposal records what it removes and launches and nothing
-// about the destinations its generator counted on.
-func TestCompactorMissesDestinationContention(t *testing.T) {
+// TestStage4StopsSecondProposalOnSharedDestination shows how stage 4 handles two
+// proposals that need the same free capacity. Two DELETE proposals each plan to
+// move one pod onto the same destination, which has room for only one of the
+// pods. The proposals delete different nodes, so RankingCompactor commits both.
+// The first proposal applies, and its pod uses the free capacity. Before the
+// second proposal's first action, the executor finds its PodsStillFit
+// precondition false and stops it.
+func TestStage4StopsSecondProposalOnSharedDestination(t *testing.T) {
 	cat := BuildCatalog()
 	destType := instanceType(t, cat, "m7i.large")
 	effCPU := cat.Effective(destType)[corev1.ResourceCPU]
@@ -51,7 +51,7 @@ func TestCompactorMissesDestinationContention(t *testing.T) {
 	// Stage 3. Disjoint candidates, so no conflict, and both commit.
 	committed, conflicts := RankingCompactor{}.SelectCounting(context.Background(), proposals, 10)
 	if len(committed) != 2 || conflicts != 0 {
-		t.Fatalf("compactor committed %d with %d conflicts; the gap is that it commits both with none",
+		t.Fatalf("compactor committed %d with %d conflicts, want both committed with none",
 			len(committed), conflicts)
 	}
 

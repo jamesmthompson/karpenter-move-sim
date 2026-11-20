@@ -38,6 +38,8 @@ func (g ProvisioningGenerator) Generate(pending []*corev1.Pod, cat *Catalog) []P
 
 Stages 3 and 4 hold every time-varying input. That is where the constraint checks live, because a constraint is what flips rather than drifting.
 
+Stage 3 and stage 4 handle conflicts between proposals in different ways. `RankingCompactor`, the stage 3 compactor, orders proposals by score. When two proposals delete the same node, it keeps the higher-ranked one and drops the other. It does not check whether two proposals plan to put pods into the same free capacity on one destination node. Stage 4 handles that case. The first of the two proposals to execute uses the capacity. Before the second proposal's first action, the executor checks its `PodsStillFit` precondition, finds that the pods no longer fit, and stops the proposal before it changes anything. `TestStage4StopsSecondProposalOnSharedDestination` shows this with two DELETE proposals. Each plans to move one pod onto the same destination, which has room for only one of the two pods.
+
 ## What it reproduces
 
 The scoring matches upstream's `ScoreMove` and `ComputeRescheduleDisruptionCost` to 1e-9 across every scenario in upstream's own `balanced_scoring_test.go` and `balanced_adversarial_test.go`. `TestScoreMatchesUpstream` imports `sigs.k8s.io/karpenter/pkg/controllers/disruption` and runs all 31 scenarios (26 and 5, counting each `DescribeTable` entry) through both, asserting agreement on the score to 1e-9 and on approve/reject exactly. Each row cites the upstream line it reproduces. That includes the guards: a move with zero disruption scores +Inf and is approved, and a move with negative savings scores 0.
@@ -79,8 +81,6 @@ Topology spread is the only one of the four with no status field standing in for
 ## Known gaps
 
 `GangIntact` is unimplemented, because nothing in the model carries a workload's minimum simultaneous member count. It is excluded from the locality table rather than counted as cheap.
-
-The compactor detects two proposals removing the same node. It cannot detect two proposals planning against the same free capacity on the same destination, because a proposal records what it removes and what it launches but nothing about the destinations its generator counted on. Those surface at apply time as a `PodsStillFit` failure. `TestCompactorMissesDestinationContention` shows it: two DELETEs, each planned onto one destination that holds either source's pod but not both, are both committed with no conflict, and the second stops on `PodsStillFit`.
 
 Placement is not the Kubernetes scheduler. `Pick` chooses among nodes with room using first-fit over sorted node IDs (the default), or the kube-scheduler's `LeastAllocated` (spread) and `MostAllocated` (pack) scorers (`simrun -placement`). Its only filter is capacity and pod slots; affinity, taints and topology spread are checked as preconditions, not used to pick a node. So it is adequate for measuring stage costs and wrong for anything claiming placement fidelity.
 
