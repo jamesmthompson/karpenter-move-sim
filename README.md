@@ -64,7 +64,7 @@ Locality belongs to the topology key rather than the constraint kind. A hostname
 
 Topology spread is the only one of the four with no status field standing in for the distribution.
 
-**Stage 1's reduction.** At the default threshold it keeps 146 of 200 nodes. Across k: 38.5% at k=1, 64% at 1.5, 73% at 2, 79% at 3. This is a soundness filter and not a search-space reduction. The delete ratio bounds a node's best possible move, so a node below the threshold cannot produce a passing one, and the rest genuinely could.
+**Stage 1's reduction.** On the fixture `simrun -nodes 200 -seed 7` builds, at the default k=2 it keeps 149 of 200 nodes. Across k: 30.5% at k=1, 65% at 1.5, 74.5% at 2, 81% at 3. `TestStage1Reduction` asserts these counts. This is a soundness filter and not a search-space reduction. The delete ratio bounds a node's best possible move, so a node below the threshold cannot produce a passing one, and the rest genuinely could.
 
 ## Fixtures
 
