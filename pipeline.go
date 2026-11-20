@@ -28,14 +28,13 @@ import (
 // DELETE and REPLACE, which stage 2 emits as alternatives without knowing which
 // will win.
 //
-// Overlap here means candidates only. Two proposals planning against the same
-// free capacity on the same destination are NOT detected, and this compactor
-// cannot detect them: a Proposal records the nodes it removes and the instance
-// types it launches, and nothing about the existing destinations its generator
-// counted on. The information is not in the type. Everything that survives to
-// apply time therefore falls to PodsStillFit, and a run where most committed
-// proposals stop on PodsStillFit is that gap being measured rather than a bug in
-// the checker.
+// Overlap here means candidates only. The compactor does not check whether two
+// proposals plan to put pods into the same free capacity on one destination. It
+// could not, because a Proposal records the nodes it removes and the instance
+// types it launches, and nothing about the destinations its generator planned to
+// use. Stage 4 handles that case. The first proposal to execute uses the
+// capacity, and the executor stops the second on PodsStillFit before the second
+// changes anything. See TestStage4StopsSecondProposalOnSharedDestination.
 type RankingCompactor struct{}
 
 // Select satisfies Compactor. The conflict count is dropped, which is why
@@ -221,6 +220,16 @@ type Cluster struct {
 	// where some succeed and some do not. See FailLaunchesOf and FailLaunchAfter.
 	LaunchFails func(*cloudprovider.InstanceType) bool
 
+	// WriteFails decides which node writes the API server refuses. A node write
+	// is a taint, an eviction or a NodeClaim delete, and the hook receives the
+	// action kind and the node's provider ID. Nil accepts every write, which is
+	// what every existing run assumes.
+	//
+	// It exists so a test can make one write fail partway through a proposal.
+	// Without it, a write fails only when its node is gone, and nothing in a pass
+	// removes a node between a precondition check and the write after it.
+	WriteFails func(kind ActionKind, providerID string) bool
+
 	// Totals and Threshold are what ScoreStillClears compares against. They enter
 	// with the cluster because stage 3 is the first stage holding both: the pass's
 	// denominators and the approval floor stage 2 used.
@@ -316,7 +325,30 @@ func (c *Cluster) Taint(providerID string) error {
 	if !ok || n.Deleted {
 		return fmt.Errorf("taint %s: node is gone", providerID)
 	}
+	if err := c.refuseWrite(Taint, providerID); err != nil {
+		return err
+	}
 	n.Tainted = true
+	return nil
+}
+
+// WriteFailure is the API server refusing a node write that WriteFails selected.
+// The executor treats it as a mechanism fault, the same as a write against a node
+// that is gone.
+type WriteFailure struct {
+	Kind       ActionKind
+	ProviderID string
+}
+
+func (e *WriteFailure) Error() string {
+	name := map[ActionKind]string{Taint: "taint", Evict: "evict", Delete: "delete"}[e.Kind]
+	return fmt.Sprintf("%s %s: write refused", name, e.ProviderID)
+}
+
+func (c *Cluster) refuseWrite(kind ActionKind, providerID string) error {
+	if c.WriteFails != nil && c.WriteFails(kind, providerID) {
+		return &WriteFailure{Kind: kind, ProviderID: providerID}
+	}
 	return nil
 }
 
@@ -386,6 +418,9 @@ func (c *Cluster) Evict(providerID string, prefer string) error {
 		// The generator emitted one Evict per pod it saw. Fewer pods now means
 		// the workload finished on its own, which is not a failure.
 		return nil
+	}
+	if err := c.refuseWrite(Evict, providerID); err != nil {
+		return err
 	}
 	pod := n.Pods[0]
 	n.Pods = n.Pods[1:]
@@ -472,6 +507,9 @@ func (c *Cluster) Delete(providerID string) error {
 	n, ok := c.Nodes[providerID]
 	if !ok || n.Deleted {
 		return fmt.Errorf("delete %s: node is gone", providerID)
+	}
+	if err := c.refuseWrite(Delete, providerID); err != nil {
+		return err
 	}
 	left := n.Pods
 	n.Pods = nil
