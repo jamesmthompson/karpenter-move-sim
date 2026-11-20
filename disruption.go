@@ -6,6 +6,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 	disruptionutils "sigs.k8s.io/karpenter/pkg/utils/disruption"
 )
 
@@ -25,15 +26,16 @@ import (
 // disrupt because it is leaving anyway, and it drives eviction-order sorting. The
 // second is what balanced scoring divides by, and it has no lifetime term.
 //
-// The simulator scores moves, so it needs the second. The merged RFC declined to
-// add a `karpenter.sh/disruption-cost` annotation and reuses pod-deletion-cost
-// and pod priority instead, noting that "a separate annotation could be
+// The simulator scores moves, so it needs the second. The merged RFC reused
+// pod-deletion-cost and pod priority, noting that "a separate annotation could be
 // introduced later if eviction ordering and consolidation gating need to
-// diverge." So this derivation is a policy choice with a stated escape hatch.
+// diverge." Upstream has since taken that escape hatch: as of v1.15 EvictionCost
+// reads `karpenter.sh/disruption-cost` first and falls back to pod-deletion-cost
+// only while the PodDeletionCostManagement feature gate is off (its default).
 
 // PerNodeBaseDisruptionCost is the inherent cost of draining a node: cordon,
 // drain, API calls, replacement latency. Upstream names the same constant in
-// pkg/controllers/disruption/types.go.
+// pkg/utils/disruption/disruption.go.
 //
 // The RFC calls 1.0 a placeholder. It keeps an empty node's cost above zero, so
 // the score stays finite and empty deletes need no special case, and it leaves
@@ -54,7 +56,8 @@ const PerNodeBaseDisruptionCost = 1.0
 // the more it hurts, which is why the clamp is here and not in EvictionCost.
 // Eviction ordering still sees the signed value.
 //
-// This mirrors upstream's computeRescheduleDisruptionCost.
+// This mirrors upstream's ComputeRescheduleDisruptionCost in
+// pkg/utils/disruption/disruption.go.
 //
 // It is a sum, so it cannot price a workload whose value is all-or-nothing: a
 // gang of five members costs five restarts here, when the truth is one outage.
@@ -84,9 +87,18 @@ func RescheduleDisruptionCost(pods []*corev1.Pod) float64 {
 // about the denominator, and it is why the RFC leaves room for a separate
 // annotation.
 func EvictionCost(p *corev1.Pod) float64 {
-	// Upstream takes a context only to log annotation parse failures.
-	return disruptionutils.EvictionCost(context.Background(), p)
+	return disruptionutils.EvictionCost(evictionCostCtx, p)
 }
+
+// evictionCostCtx carries the options upstream's EvictionCost reads. Since v1.15
+// it consults the PodDeletionCostManagement feature gate to decide whether
+// pod-deletion-cost counts, and it panics if the context has no options. The
+// simulator runs with upstream's default gates, so the gate is off and
+// pod-deletion-cost is read as user intent, as it was before v1.15. Otherwise
+// the context is used only to log annotation parse failures.
+var evictionCostCtx = options.ToContext(context.Background(), &options.Options{
+	FeatureGates: options.DefaultFeatureGates(),
+})
 
 // IsEffectivelyEmpty reports whether a node carries no reschedulable pods, which
 // upstream expresses as its cost having only the baseline in it.

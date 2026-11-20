@@ -2,7 +2,7 @@
 
 A simulator for Karpenter consolidation decisions, structured as four stages, built to test whether the first two can work without reading cluster state.
 
-Compiles against upstream Karpenter's own types, pinned to a commit rather than a tag because balanced consolidation ([#2962](https://github.com/kubernetes-sigs/karpenter/pull/2962)) merged after v1.8.2.
+Compiles against upstream Karpenter's own types, pinned to release v1.15.1. Balanced consolidation ([#2962](https://github.com/kubernetes-sigs/karpenter/pull/2962)) ships in tagged releases from v1.14.0 on.
 
 ```
 go test ./...
@@ -38,7 +38,7 @@ Stages 3 and 4 hold every time-varying input. That is where the constraint check
 
 ## What it reproduces
 
-The scoring matches upstream's `ScoreMove` and `computeRescheduleDisruptionCost` to 1e-9 across every scenario in upstream's own `balanced_scoring_test.go` and `balanced_adversarial_test.go`.
+The scoring matches upstream's `ScoreMove` and `ComputeRescheduleDisruptionCost` to 1e-9 across every scenario in upstream's own `balanced_scoring_test.go` and `balanced_adversarial_test.go`.
 
 It reproduces the design's central worked example. Two nodes, identical savings, identical pod counts. One holds stateless proxies, the other holds model servers carrying maximum `pod-deletion-cost`. Node A scores 2.2292 against the design's 2.24 and is approved; node B scores 0.2876 against 0.29 and is rejected. Savings-versus-pod-count cannot produce that.
 
