@@ -4,6 +4,8 @@ import (
 	"sort"
 
 	corev1 "k8s.io/api/core/v1"
+
+	disruptionutils "sigs.k8s.io/karpenter/pkg/utils/disruption"
 )
 
 // The decision unit is the workload scope, not the node.
@@ -84,12 +86,10 @@ func (c Candidate) DeleteRatio(totals PoolTotals) float64 {
 }
 
 // SavingsRatio is price per unit of disruption at the candidate's scale, the
-// unnormalized form the paths rank by.
+// unnormalized form the paths rank by. Upstream's disruptionutils.SavingsRatio,
+// which panics on a zero disruption cost.
 func (c Candidate) SavingsRatio() float64 {
-	if c.DisruptionCost == 0 {
-		return 0
-	}
-	return c.Price / c.DisruptionCost
+	return disruptionutils.SavingsRatio(c.Price, c.DisruptionCost)
 }
 
 // NodeIDs names the nodes the move acts on, which is the read set the locality

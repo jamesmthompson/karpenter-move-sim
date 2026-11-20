@@ -2,7 +2,6 @@ package sim
 
 import (
 	"context"
-	"math"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -34,8 +33,8 @@ import (
 // only while the PodDeletionCostManagement feature gate is off (its default).
 
 // PerNodeBaseDisruptionCost is the inherent cost of draining a node: cordon,
-// drain, API calls, replacement latency. Upstream names the same constant in
-// pkg/utils/disruption/disruption.go.
+// drain, API calls, replacement latency. It is upstream's constant from
+// pkg/utils/disruption/disruption.go, re-exported rather than copied.
 //
 // The RFC calls 1.0 a placeholder. It keeps an empty node's cost above zero, so
 // the score stays finite and empty deletes need no special case, and it leaves
@@ -46,7 +45,7 @@ import (
 // the baseline is 9% of its total, while on a 1-pod node the same 1.0 is half the
 // total. It therefore weighs against consolidating nodes with few pods, which the
 // RFC acknowledges it has not modeled precisely.
-const PerNodeBaseDisruptionCost = 1.0
+const PerNodeBaseDisruptionCost = disruptionutils.PerNodeBaseDisruptionCost
 
 // RescheduleDisruptionCost is what balanced scoring divides by: the per-node
 // baseline plus the eviction cost of every pod that would have to move, with
@@ -56,8 +55,8 @@ const PerNodeBaseDisruptionCost = 1.0
 // the more it hurts, which is why the clamp is here and not in EvictionCost.
 // Eviction ordering still sees the signed value.
 //
-// This mirrors upstream's ComputeRescheduleDisruptionCost in
-// pkg/utils/disruption/disruption.go.
+// It calls upstream's ComputeRescheduleDisruptionCost in
+// pkg/utils/disruption/disruption.go with evictionCostCtx, so it cannot drift.
 //
 // It is a sum, so it cannot price a workload whose value is all-or-nothing: a
 // gang of five members costs five restarts here, when the truth is one outage.
@@ -65,11 +64,7 @@ const PerNodeBaseDisruptionCost = 1.0
 // for term on pods carrying no gang label. This one is kept because it is what
 // upstream computes, and the divergence should be visible rather than absorbed.
 func RescheduleDisruptionCost(pods []*corev1.Pod) float64 {
-	cost := PerNodeBaseDisruptionCost
-	for _, p := range pods {
-		cost += math.Max(0, EvictionCost(p))
-	}
-	return cost
+	return disruptionutils.ComputeRescheduleDisruptionCost(evictionCostCtx, pods)
 }
 
 // EvictionCost calls upstream's pkg/utils/disruption.EvictionCost, so the

@@ -8,6 +8,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	disruptionutils "sigs.k8s.io/karpenter/pkg/utils/disruption"
 )
 
 // Upstream runs three distinct disruption methods over the same cluster, and the
@@ -100,11 +101,13 @@ const MultiNodeMaxParallel = 100
 // saves $0.1724, a factor of 3.07. Upstream ranks first and decides the move
 // second, so it never sees that gap; RankingCompactor ranks the move, so it does.
 // See TestSavingsRatioAndScoreDisagree.
+//
+// It calls upstream's disruptionutils.SavingsRatio, so it panics on a zero
+// disruption cost as upstream does. Every snapshot that reaches a ranking has
+// passed Totals, which refuses a cost below PerNodeBaseDisruptionCost, so the
+// panic marks a hand-built snapshot that skipped the floor.
 func SavingsRatio(n NodeSnapshot) float64 {
-	if n.DisruptionCost == 0 {
-		return 0
-	}
-	return n.Price / n.DisruptionCost
+	return disruptionutils.SavingsRatio(n.Price, n.DisruptionCost)
 }
 
 // sortBySavingsRatio orders candidates by SavingsRatio descending, upstream's
