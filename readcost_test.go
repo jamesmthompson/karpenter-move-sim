@@ -431,6 +431,14 @@ func TestNodeReadsPerCheck(t *testing.T) {
 			t.Errorf("%s claims local but reads %d/%d/%d across N=10/100/1000",
 				name, r[0].perDecision, r[1].perDecision, r[2].perDecision)
 		}
+		// And the constant is the README table's: one node, the destination for the
+		// hostname terms and the PDB's own status for the PDB row. Flat at 2 would
+		// still be local and would make the table wrong.
+		for _, rc := range r {
+			if rc.perDecision != 1 {
+				t.Errorf("%s at N=%d read %d nodes, README table says 1", name, rc.nodes, rc.perDecision)
+			}
+		}
 	}
 
 	// Non-local means the number tracks the cluster. Spread reads every standing
