@@ -597,7 +597,7 @@ func batchReplacement(batch []NodeSnapshot, pods []*corev1.Pod, sumPrice float64
 		if !fits(it) {
 			continue
 		}
-		p, available := cheapestOffering(it)
+		p, available := cat.LaunchPrice(it)
 		if !available || p >= maxPrice {
 			continue
 		}

@@ -80,10 +80,7 @@ func (c Candidate) Disruptable() bool {
 // its nodes over its single step disruption cost. For a node candidate it reduces
 // to DeleteRatio of that node, term for term.
 func (c Candidate) DeleteRatio(totals PoolTotals) float64 {
-	if totals.Cost == 0 || totals.DisruptionCost == 0 || c.DisruptionCost == 0 {
-		return 0
-	}
-	return (c.Price / totals.Cost) / (c.DisruptionCost / totals.DisruptionCost)
+	return Score(c.Price, c.DisruptionCost, totals)
 }
 
 // SavingsRatio is price per unit of disruption at the candidate's scale, the

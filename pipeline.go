@@ -325,7 +325,7 @@ func (c *Cluster) Launch(it *cloudprovider.InstanceType) (string, error) {
 	if it == nil {
 		return "", errors.New("launch: nil instance type")
 	}
-	price, ok := cheapestOffering(it)
+	price, ok := c.Catalog.LaunchPrice(it)
 	if !ok {
 		return "", fmt.Errorf("launch %s: no available offering", it.Name)
 	}
@@ -580,7 +580,7 @@ func (k *ScoreStillClearsChecker) Check(_ context.Context, p Proposal) error {
 		if it == nil {
 			continue
 		}
-		if price, ok := cheapestOffering(it); ok {
+		if price, ok := k.Cluster.Catalog.LaunchPrice(it); ok {
 			savings -= price
 		}
 	}

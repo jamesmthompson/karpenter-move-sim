@@ -139,18 +139,33 @@ func memReserveBytes(maxPods int64) int64 {
 	return (255 + 11*maxPods) * (1 << 20)
 }
 
-// cheapestOffering returns the lowest available price for one instance type.
+// cheapestOffering returns the lowest launchable price for one instance type,
+// under no requirements. Callers holding a Catalog use Catalog.LaunchPrice.
 func cheapestOffering(it *cloudprovider.InstanceType) (float64, bool) {
-	price, found := 0.0, false
+	return launchPrice(it, nil)
+}
+
+// launchPrice is upstream's replacement pricing from EstimatedSavings:
+// Offerings.Launchable().Compatible(reqs).Cheapest(). Launchable rather than
+// Available, so a full reservation does not price a launch at its reserved rate.
+// Nil requirements filter nothing.
+func launchPrice(it *cloudprovider.InstanceType, reqs scheduling.Requirements) (float64, bool) {
+	if it == nil {
+		return 0, false
+	}
+	var ofs cloudprovider.Offerings
 	for _, o := range it.Offerings {
-		if !o.Available {
-			continue
-		}
-		if !found || o.Price < price {
-			price, found = o.Price, true
+		if o.Launchable() {
+			ofs = append(ofs, o)
 		}
 	}
-	return price, found
+	if reqs != nil {
+		ofs = ofs.Compatible(reqs)
+	}
+	if len(ofs) == 0 {
+		return 0, false
+	}
+	return ofs.Cheapest().Price, true
 }
 
 // -----------------------------------------------------------------------------

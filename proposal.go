@@ -12,12 +12,14 @@ package sim
 
 import (
 	"context"
+	"math"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/scheduling"
 )
 
 // Catalog is the set of instance types a NodePool may launch, with prices.
@@ -29,10 +31,29 @@ type Catalog struct {
 	// Overhead is deducted from every instance type's allocatable capacity
 	// before anything is placed. See catalog.go.
 	Overhead DaemonSetOverhead
+
+	// Requirements restrict which offerings a launch may use, the NodePool's
+	// requirements as upstream's replacement NodeClaim carries them. Upstream's
+	// EstimatedSavings prices a replacement from
+	// Offerings.Launchable().Compatible(nodeClaim.Requirements).Cheapest(), so a
+	// spot offering cannot price a replacement for an on-demand-only NodePool.
+	// Nil allows every offering, which is what BuildCatalog's single-zone,
+	// on-demand-only catalog needs.
+	Requirements scheduling.Requirements
 }
 
-// Cheapest returns the lowest-priced available offering across the catalog that
-// satisfies fits. It is the local provisioning primitive: given requirements,
+// LaunchPrice is what a new node of this type costs under the catalog's
+// requirements: the cheapest launchable offering compatible with them. A nil
+// catalog applies no requirements.
+func (c *Catalog) LaunchPrice(it *cloudprovider.InstanceType) (float64, bool) {
+	if c == nil {
+		return launchPrice(it, nil)
+	}
+	return launchPrice(it, c.Requirements)
+}
+
+// Cheapest returns the lowest-priced launchable offering, compatible with the
+// catalog's requirements, across the catalog that satisfies fits. It is the local provisioning primitive: given requirements,
 // return capacity, with no reference to what else is running.
 //
 // This is alone_cost from the pricing work. Relational constraints cannot be
@@ -45,13 +66,12 @@ func (c *Catalog) Cheapest(fits func(*cloudprovider.InstanceType) bool) (*cloudp
 		if !fits(it) {
 			continue
 		}
-		for _, o := range it.Offerings {
-			if !o.Available {
-				continue
-			}
-			if best == nil || o.Price < bestPrice {
-				best, bestPrice = it, o.Price
-			}
+		price, ok := c.LaunchPrice(it)
+		if !ok {
+			continue
+		}
+		if best == nil || price < bestPrice {
+			best, bestPrice = it, price
 		}
 	}
 	return best, bestPrice, best != nil
@@ -102,13 +122,11 @@ type PoolTotals struct {
 //
 // This is the node form. Candidate.DeleteRatio is the same arithmetic at the
 // decision unit, and the two agree term for term on a node holding no gang member.
+//
+// It is Score of a DELETE, which is what upstream's CanPassThreshold computes:
+// ScoreMove(c.Price, c.RescheduleDisruptionCost, totals, k).
 func DeleteRatio(n NodeSnapshot, totals PoolTotals) float64 {
-	if totals.Cost == 0 || totals.DisruptionCost == 0 || n.DisruptionCost == 0 {
-		return 0
-	}
-	savingsFraction := n.Price / totals.Cost
-	disruptionFraction := n.DisruptionCost / totals.DisruptionCost
-	return savingsFraction / disruptionFraction
+	return Score(n.Price, n.DisruptionCost, totals)
 }
 
 // Identify is stage 1, projected back onto the node list: one bit per node,
@@ -325,12 +343,32 @@ func (r Reason) String() string {
 // prices are fixed, pool cost moves when the node set changes, and disruption
 // cost moves by one pod's eviction cost when one pod binds. Nothing here has a
 // cliff, which is why the score grades rather than gates.
+//
+// The guards are upstream's, in the order upstream applies them: ScoreMove in
+// pkg/controllers/disruption/balanced.go returns a zero result for non-positive
+// pool totals, and ScoreResult.Score in types.go returns 0 for non-positive
+// savings and +Inf for zero disruption. So a move that saves nothing scores 0 and
+// is rejected at any positive threshold, and a move that disrupts nothing scores
+// +Inf and is approved at any threshold. TestScoreMatchesUpstream runs every
+// scenario in upstream's balanced_scoring_test.go and balanced_adversarial_test.go
+// through this and through upstream's ScoreMove and requires agreement to 1e-9.
+//
+// The one intended difference sits upstream of this function: the simulator
+// refuses a NaN, infinite, zero or negative node price in Totals and the fixture
+// generators (TestNonFinitePriceRejected), where upstream's ResolveOfferingPrice
+// maps an unresolvable or NaN price to 0 and scores on.
 func Score(savings, disruptionCost float64, totals PoolTotals) float64 {
-	if totals.Cost == 0 || totals.DisruptionCost == 0 || disruptionCost == 0 {
+	if totals.Cost <= 0 || totals.DisruptionCost <= 0 {
 		return 0
 	}
 	savingsFraction := savings / totals.Cost
 	disruptionFraction := disruptionCost / totals.DisruptionCost
+	if savingsFraction <= 0 {
+		return 0
+	}
+	if disruptionFraction == 0 {
+		return math.Inf(1)
+	}
 	return savingsFraction / disruptionFraction
 }
 

@@ -38,7 +38,11 @@ Stages 3 and 4 hold every time-varying input. That is where the constraint check
 
 ## What it reproduces
 
-The scoring matches upstream's `ScoreMove` and `ComputeRescheduleDisruptionCost` to 1e-9 across every scenario in upstream's own `balanced_scoring_test.go` and `balanced_adversarial_test.go`.
+The scoring matches upstream's `ScoreMove` and `ComputeRescheduleDisruptionCost` to 1e-9 across every scenario in upstream's own `balanced_scoring_test.go` and `balanced_adversarial_test.go`. `TestScoreMatchesUpstream` imports `sigs.k8s.io/karpenter/pkg/controllers/disruption` and runs all 31 scenarios (26 and 5, counting each `DescribeTable` entry) through both, asserting agreement on the score to 1e-9 and on approve/reject exactly. Each row cites the upstream line it reproduces. That includes the guards: a move with zero disruption scores +Inf and is approved, and a move with negative savings scores 0.
+
+There is one intended difference. Upstream's `ResolveOfferingPrice` maps a NaN or unresolvable node price to 0 and scores on. The simulator refuses a NaN, infinite, zero or negative price outright (`Totals` and the fixture generators panic, `TestNonFinitePriceRejected`), because a silently zero-priced node understates the pool total and inflates every score in it. The three scenarios that feed upstream such a price assert the panic and check the rest of upstream's numbers.
+
+The simulator has no `ConsolidationPolicy` and scores every pool as Balanced. Upstream's scenarios about non-Balanced pools check the Balanced part and say what they skip.
 
 It reproduces the design's central worked example. Two nodes, identical savings, identical pod counts. One holds stateless proxies, the other holds model servers carrying maximum `pod-deletion-cost`. Node A scores 2.2292 against the design's 2.24 and is approved; node B scores 0.2876 against 0.29 and is rejected. Savings-versus-pod-count cannot produce that.
 
