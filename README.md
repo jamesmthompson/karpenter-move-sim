@@ -26,7 +26,9 @@ So grade the smooth quantity and gate the sharp ones. A move becomes a proposal 
 | 3. Planning and budgets | budget consumed, in-flight proposals | yes |
 | 4. Execution | live cluster at apply time | yes |
 
-The claim is in the signatures. Neither `Identify` nor either `Generate` accepts a `context.Context`, a `client.Client`, or a cluster handle, so they cannot read global state and the compiler enforces it.
+The claim is in the signatures. Neither `Identify` nor either `Generate` accepts a `context.Context`, a `client.Client`, or a cluster handle, so they cannot read global state and the compiler enforces it. `TestStageSignaturesTakeNoClusterHandle` pins the three parameter lists by reflection and rejects a context, client, `*Cluster`, `*NodeReader`, `state.Cluster` or function anywhere in an argument's own fields.
+
+One package-level value is reachable from stages 1 and 2: `evictionCostCtx` in `disruption.go`, the `context.Context` upstream's `EvictionCost` requires since v1.15. It carries only upstream's default feature gates (`options.DefaultFeatureGates()`), which decide whether `pod-deletion-cost` counts, and no cluster state.
 
 ```go
 func Identify(nodes []NodeSnapshot, totals PoolTotals, k float64) []bool
