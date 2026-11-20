@@ -46,6 +46,8 @@ There is one intended difference. Upstream's `ResolveOfferingPrice` maps a NaN o
 
 The simulator has no `ConsolidationPolicy` and scores every pool as Balanced. Upstream's scenarios about non-Balanced pools check the Balanced part and say what they skip.
 
+It runs upstream's disruption methods in upstream's order: Emptiness, then multi-node consolidation (`MultiNodeEvaluation` in `paths.go`, with upstream's binary search over a ratio-sorted batch capped at `MultiNodeMaxParallel`), then single-node. `TestPathsRunInUpstreamOrder`, `TestBinarySearchWindow`, `TestMultiNodeMonotonicityViolation` and `TestBatchIsAllOrNothing` cover the multi-node path.
+
 It reproduces the design's central worked example. Two nodes, identical savings, identical pod counts. One holds stateless proxies, the other holds model servers carrying maximum `pod-deletion-cost`. Node A scores 2.2292 against the design's 2.24 and is approved; node B scores 0.2876 against 0.29 and is rejected. Savings-versus-pod-count cannot produce that.
 
 ## What it measures
@@ -78,11 +80,9 @@ Topology spread is the only one of the four with no status field standing in for
 
 `GangIntact` is unimplemented, because nothing in the model carries a workload's minimum simultaneous member count. It is excluded from the locality table rather than counted as cheap.
 
-Multi-node consolidation is not built. Upstream attempts multi-node before single-node, and that is where a search-space reduction would come from.
+The compactor detects two proposals removing the same node. It cannot detect two proposals planning against the same free capacity on the same destination, because a proposal records what it removes and what it launches but nothing about the destinations its generator counted on. Those surface at apply time as a `PodsStillFit` failure. `TestCompactorMissesDestinationContention` shows it: two DELETEs, each planned onto one destination that holds either source's pod but not both, are both committed with no conflict, and the second stops on `PodsStillFit`.
 
-The compactor detects two proposals removing the same node. It cannot detect two proposals planning against the same free capacity on the same destination, because a proposal records what it removes and what it launches but nothing about the destinations its generator counted on. Those surface at apply time as a `PodsStillFit` failure.
-
-Placement is first-fit over sorted node IDs, not the Kubernetes scheduler. Adequate for measuring stage costs, wrong for anything claiming placement fidelity.
+Placement is not the Kubernetes scheduler. `Pick` chooses among nodes with room using first-fit over sorted node IDs (the default), or the kube-scheduler's `LeastAllocated` (spread) and `MostAllocated` (pack) scorers (`simrun -placement`). Its only filter is capacity and pod slots; affinity, taints and topology spread are checked as preconditions, not used to pick a node. So it is adequate for measuring stage costs and wrong for anything claiming placement fidelity.
 
 ## Reproducibility
 
